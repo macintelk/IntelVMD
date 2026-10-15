@@ -1,0 +1,385 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2E0CAD5A2ED2924700DFFAC2 /* IOPCIFamilyDefinitions.h in Headers */ = {isa = PBXBuildFile; fileRef = 2E0CAD542ED2924700DFFAC2 /* IOPCIFamilyDefinitions.h */; };
+		2E0CAD5B2ED2924700DFFAC2 /* IOAGPDevice.h in Headers */ = {isa = PBXBuildFile; fileRef = 2E0CAD552ED2924700DFFAC2 /* IOAGPDevice.h */; };
+		2E0CAD5C2ED2924700DFFAC2 /* IOPCIConfigurator.h in Headers */ = {isa = PBXBuildFile; fileRef = 2E0CAD562ED2924700DFFAC2 /* IOPCIConfigurator.h */; };
+		2E0CAD5D2ED2924700DFFAC2 /* IOPCIPrivate.h in Headers */ = {isa = PBXBuildFile; fileRef = 2E0CAD572ED2924700DFFAC2 /* IOPCIPrivate.h */; };
+		2E0CAD5E2ED2924700DFFAC2 /* IOPCIDevice.h in Headers */ = {isa = PBXBuildFile; fileRef = 2E0CAD582ED2924700DFFAC2 /* IOPCIDevice.h */; };
+		2E0CAD5F2ED2924700DFFAC2 /* IOPCIBridge.h in Headers */ = {isa = PBXBuildFile; fileRef = 2E0CAD592ED2924700DFFAC2 /* IOPCIBridge.h */; };
+		2EE3140F2D348FAB00E9D39E /* VMD.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 2EE3140D2D348FAB00E9D39E /* VMD.hpp */; };
+		2EE314102D348FAB00E9D39E /* VMD.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 2EE3140E2D348FAB00E9D39E /* VMD.cpp */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		2E0CAD542ED2924700DFFAC2 /* IOPCIFamilyDefinitions.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IOPCIFamilyDefinitions.h; sourceTree = "<group>"; };
+		2E0CAD552ED2924700DFFAC2 /* IOAGPDevice.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IOAGPDevice.h; sourceTree = "<group>"; };
+		2E0CAD562ED2924700DFFAC2 /* IOPCIConfigurator.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IOPCIConfigurator.h; sourceTree = "<group>"; };
+		2E0CAD572ED2924700DFFAC2 /* IOPCIPrivate.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IOPCIPrivate.h; sourceTree = "<group>"; };
+		2E0CAD582ED2924700DFFAC2 /* IOPCIDevice.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IOPCIDevice.h; sourceTree = "<group>"; };
+		2E0CAD592ED2924700DFFAC2 /* IOPCIBridge.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IOPCIBridge.h; sourceTree = "<group>"; };
+		2E462E662C56CB3F00FE6D4C /* IntelVMD.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = IntelVMD.kext; sourceTree = BUILT_PRODUCTS_DIR; };
+		2E462E6D2C56CB3F00FE6D4C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		2EE3140D2D348FAB00E9D39E /* VMD.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = VMD.hpp; sourceTree = "<group>"; };
+		2EE3140E2D348FAB00E9D39E /* VMD.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = VMD.cpp; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		2E462E632C56CB3F00FE6D4C /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		2E0CAD522ED2924700DFFAC2 /* IOKit */ = {
+			isa = PBXGroup;
+			children = (
+				2E0CAD532ED2924700DFFAC2 /* pci */,
+			);
+			path = IOKit;
+			sourceTree = "<group>";
+		};
+		2E0CAD532ED2924700DFFAC2 /* pci */ = {
+			isa = PBXGroup;
+			children = (
+				2E0CAD542ED2924700DFFAC2 /* IOPCIFamilyDefinitions.h */,
+				2E0CAD552ED2924700DFFAC2 /* IOAGPDevice.h */,
+				2E0CAD562ED2924700DFFAC2 /* IOPCIConfigurator.h */,
+				2E0CAD572ED2924700DFFAC2 /* IOPCIPrivate.h */,
+				2E0CAD582ED2924700DFFAC2 /* IOPCIDevice.h */,
+				2E0CAD592ED2924700DFFAC2 /* IOPCIBridge.h */,
+			);
+			path = pci;
+			sourceTree = "<group>";
+		};
+		2E462E5C2C56CB3F00FE6D4C = {
+			isa = PBXGroup;
+			children = (
+				2E462E682C56CB3F00FE6D4C /* IntelVMD */,
+				2E462E672C56CB3F00FE6D4C /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		2E462E672C56CB3F00FE6D4C /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				2E462E662C56CB3F00FE6D4C /* IntelVMD.kext */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		2E462E682C56CB3F00FE6D4C /* IntelVMD */ = {
+			isa = PBXGroup;
+			children = (
+				2EE3140E2D348FAB00E9D39E /* VMD.cpp */,
+				2EE3140D2D348FAB00E9D39E /* VMD.hpp */,
+				2E462E6D2C56CB3F00FE6D4C /* Info.plist */,
+				2E0CAD522ED2924700DFFAC2 /* IOKit */,
+			);
+			path = IntelVMD;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXHeadersBuildPhase section */
+		2E462E612C56CB3F00FE6D4C /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2E0CAD5C2ED2924700DFFAC2 /* IOPCIConfigurator.h in Headers */,
+				2E0CAD5B2ED2924700DFFAC2 /* IOAGPDevice.h in Headers */,
+				2E0CAD5A2ED2924700DFFAC2 /* IOPCIFamilyDefinitions.h in Headers */,
+				2E0CAD5E2ED2924700DFFAC2 /* IOPCIDevice.h in Headers */,
+				2E0CAD5F2ED2924700DFFAC2 /* IOPCIBridge.h in Headers */,
+				2EE3140F2D348FAB00E9D39E /* VMD.hpp in Headers */,
+				2E0CAD5D2ED2924700DFFAC2 /* IOPCIPrivate.h in Headers */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXHeadersBuildPhase section */
+
+/* Begin PBXNativeTarget section */
+		2E462E652C56CB3F00FE6D4C /* IntelVMD */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2E462E702C56CB3F00FE6D4C /* Build configuration list for PBXNativeTarget "IntelVMD" */;
+			buildPhases = (
+				2E462E612C56CB3F00FE6D4C /* Headers */,
+				2E462E622C56CB3F00FE6D4C /* Sources */,
+				2E462E632C56CB3F00FE6D4C /* Frameworks */,
+				2E462E642C56CB3F00FE6D4C /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = IntelVMD;
+			productName = IntelVMD;
+			productReference = 2E462E662C56CB3F00FE6D4C /* IntelVMD.kext */;
+			productType = "com.apple.product-type.kernel-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		2E462E5D2C56CB3F00FE6D4C /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					2E462E652C56CB3F00FE6D4C = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = 2E462E602C56CB3F00FE6D4C /* Build configuration list for PBXProject "IntelVMD" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 2E462E5C2C56CB3F00FE6D4C;
+			productRefGroup = 2E462E672C56CB3F00FE6D4C /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				2E462E652C56CB3F00FE6D4C /* IntelVMD */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		2E462E642C56CB3F00FE6D4C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2E462E622C56CB3F00FE6D4C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2EE314102D348FAB00E9D39E /* VMD.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		2E462E6E2C56CB3F00FE6D4C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		2E462E6F2C56CB3F00FE6D4C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		2E462E712C56CB3F00FE6D4C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = NO;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1.0.0;
+				DEAD_CODE_STRIPPING = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = IntelVMD/Info.plist;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2023 osx Inc. All rights reserved.";
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/MacKernelSDK/Library/universal",
+					"$(PROJECT_DIR)/MacKernelSDK/Library/x86_64",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0.0;
+				MODULE_NAME = com.intelosx.IntelVMD;
+				MODULE_START = 0;
+				MODULE_STOP = 0;
+				MODULE_VERSION = 1.0.0d1;
+				OTHER_LDFLAGS = "-static";
+				PRODUCT_BUNDLE_IDENTIFIER = com.intelosx.IntelVMD;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				RUN_CLANG_STATIC_ANALYZER = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Debug;
+		};
+		2E462E722C56CB3F00FE6D4C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = NO;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1.0.0;
+				DEAD_CODE_STRIPPING = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = IntelVMD/Info.plist;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2023 osx Inc. All rights reserved.";
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/MacKernelSDK/Library/universal",
+					"$(PROJECT_DIR)/MacKernelSDK/Library/x86_64",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0.0;
+				MODULE_NAME = com.intelosx.IntelVMD;
+				MODULE_START = 0;
+				MODULE_STOP = 0;
+				MODULE_VERSION = 1.0.0d1;
+				OTHER_LDFLAGS = "-static";
+				PRODUCT_BUNDLE_IDENTIFIER = com.intelosx.IntelVMD;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				RUN_CLANG_STATIC_ANALYZER = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		2E462E602C56CB3F00FE6D4C /* Build configuration list for PBXProject "IntelVMD" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2E462E6E2C56CB3F00FE6D4C /* Debug */,
+				2E462E6F2C56CB3F00FE6D4C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		2E462E702C56CB3F00FE6D4C /* Build configuration list for PBXNativeTarget "IntelVMD" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2E462E712C56CB3F00FE6D4C /* Debug */,
+				2E462E722C56CB3F00FE6D4C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 2E462E5D2C56CB3F00FE6D4C /* Project object */;
+}
