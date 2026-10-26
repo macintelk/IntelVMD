@@ -29,7 +29,7 @@
 			<key>IOClass</key>
 			<string>VMDDriver</string>
 			<key>IONameMatch</key>
-			<string>VMD0</string>
+			<string>pci8086,201d pci8086,28c0 pci8086,28c1 pci8086,467f pci8086,4c3d pci8086,9a0b pci8086,a77f pci8086,7d0b pci8086,ad0b pci8086,b60b pci8086,b06f pci8086,b07f pci8086,d70b pci8086,d73b VMD0</string>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 		</dict>
@@ -41,19 +41,17 @@
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.iokit.IOPCIFamily</key>
-		<string>1.0.0</string>
+		<string>1.0.0b1</string>
 		<key>com.apple.kpi.bsd</key>
-		<string>9.0.0</string>
-		<key>com.apple.kpi.dsep</key>
 		<string>10.0.0</string>
 		<key>com.apple.kpi.iokit</key>
-		<string>9.0.0</string>
+		<string>10.0.0</string>
 		<key>com.apple.kpi.libkern</key>
-		<string>9.0.0</string>
+		<string>10.0.0</string>
 		<key>com.apple.kpi.mach</key>
-		<string>9.0.0</string>
+		<string>10.0.0</string>
 		<key>com.apple.kpi.unsupported</key>
-		<string>9.0.0</string>
+		<string>10.0.0</string>
 	</dict>
 	<key>OSBundleRequired</key>
 	<string>Local-Root</string>
