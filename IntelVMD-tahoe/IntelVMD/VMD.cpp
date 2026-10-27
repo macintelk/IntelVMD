@@ -846,17 +846,17 @@ bool VMDDriver::decodeAndPublishBars(void)
 bool VMDDriver::start(IOService *provider)
 {
     if (!vmdProbe(provider)) {
-        panic("IntelVMD: probe failed\n");
+        IOLog("IntelVMD: probe failed\n");
         return false;
     }
     if (!seedBridgeEntry()) {
-        panic("IntelVMD: cannot seed the bridge config entry\n");
+        IOLog("IntelVMD: cannot seed the bridge config entry\n");
         return false;
     }
 
     bool ok = IOPCI2PCIBridge::start(provider);
     if (!ok) {
-        panic("IntelVMD: IOPCI2PCIBridge::start failed\n");
+        IOLog("IntelVMD: IOPCI2PCIBridge::start failed\n");
         return false;
     }
 
