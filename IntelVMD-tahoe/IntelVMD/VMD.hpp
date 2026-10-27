@@ -165,31 +165,6 @@ private:
     IOWorkLoop *            fVmdWorkLoop;
     IOInterruptEventSource *fBridgeES;      /* reserves MSI-X vector 0     */
 
-    /* --- Linux pci_assign_unassigned_bus_resources() state -------------
-     * The VMD translates memory 1:1: a child BAR programmed with a host
-     * address inside MEMBAR1 (or MEMBAR2) is reached by the CPU at that
-     * same address (Linux dmesg: root bus resource [mem 0x50000000-0x51ff-
-     * ffff] == host VMD BAR2; NVMe BAR0 assigned 0x50000000).             */
-    struct VMDAssignCtx {
-        uint64_t   memWinStart, memWinSize, memCursor;
-        uint64_t   pfWinStart,  pfWinSize,  pfCursor;
-        struct Kept { uint64_t start, end; };
-        Kept       kept[48];
-        uint32_t   keptCount;
-        void keep(uint64_t start, uint64_t size) {
-            if (size && keptCount < 48) {
-                kept[keptCount].start = start;
-                kept[keptCount].end   = start + size - 1;
-                keptCount++;
-            }
-        }
-        bool overlaps(uint64_t begin, uint64_t end) const {
-            for (uint32_t i = 0; i < keptCount; i++)
-                if (begin < kept[i].end && kept[i].start < end) return true;
-            return false;
-        }
-    };
-
     bool vmdProbe(IOService *provider);
     bool decodeAndPublishBars(void);
     bool getBusNumberStart(void);
@@ -206,24 +181,6 @@ private:
                                              uint8_t dev, uint8_t fn);
     void handleBridgeInterrupt(OSObject *owner,
                                IOInterruptEventSource *src, int count);
-
-    /* pci_assign_unassigned_bus_resources() + pci_setup_bridge() port.
-     * Runs after resetDomain(): programs every BAR behind the VMD, re-opens
-     * each bridge's memory window around its children's live BARs and
-     * enables decode.  Without this stage vmd_domain_reset() leaves every
-     * bridge window CLOSED and all child MMIO reads return all-1s. */
-    void     assignDomainResources(void);
-    void     assignBusDevices(IORegistryEntry *busNub, VMDAssignCtx *ctx);
-    void     assignDeviceBars(IOPCIDevice *nub, VMDAssignCtx *ctx);
-    void     configureBridgeWindows(IOPCIDevice *bridge, VMDAssignCtx *ctx);
-    void     collectDescendantRanges(IORegistryEntry *busNub,
-                                     uint64_t *memMin, uint64_t *memMax,
-                                     uint64_t *pfMin,  uint64_t *pfMax);
-    void     refreshNubDeviceMemory(IOPCIDevice *nub);
-    uint64_t probeBarSize(IOPCIDevice *nub, uint32_t reg, bool is64);
-    uint64_t allocFromWindow(VMDAssignCtx *ctx, uint64_t size, bool isPF);
-    bool     inVMDWindow(uint64_t begin, uint64_t end, bool prefetch);
-    void     capProbeDiagnostic(IOPCIDevice *nub);
 
 public:
     /* IOService */
@@ -296,22 +253,8 @@ public:
     virtual void configWrite8( IOPCIAddressSpace space,
                                         UInt8 offset, UInt8 data ) override;
     
-    virtual bool init(OSDictionary *properties) override;
     virtual IOWorkLoop * getWorkLoop(void) const override;
     virtual void free(void) override;
-
-    /* Live-decode BAR memory accessor.  The stock IOPCIDevice getter hands
-     * out the IODeviceMemory that IOPCIFamily built at scan time; if any
-     * later stage (BIOS/Apple/this driver) moved the BAR, IONVMeController
-     * would map a stale address and read garbage.  This override re-reads
-     * the BAR from live config space and corrects the range address, so
-     * the NVMe CAP register is always read at the address the device
-     * actually decodes. */
-    virtual IODeviceMemory * getDeviceMemoryWithRegister( UInt8 reg ) override;
-    IODeviceMemory *         fFixedMemory[6];   /* live-decode ranges we fabricated (nub holds 1 ref each) */
-    uint64_t                 fBarSize[6];       /* BAR sizes recorded at assign time — sized BEFORE
-                                                 * any driver is live, so the accessor never has to
-                                                 * run the (BAR-writing) size probe on a live device */
 
     /* Access to IOPCIDevice-protected state (configEntry / msiVectors).
      * Defined as static members of VMDChildDevice because protected-member
