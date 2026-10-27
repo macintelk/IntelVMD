@@ -912,8 +912,39 @@ void VMDDriver::configure1( IOService * provider )
         memoryArray->release();
     }
 
-    pciDevice->configWrite32(kIOPCIConfigBaseAddress0,  0);
-    pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03100000);
+    /* ------------------------------------------------------------------
+     * Fix Apple's misprogrammed VMD BARs BEFORE the domain scan
+     * ("fix apple wrong 32 bit bars at start so scan can work").
+     *
+     * Values are the BIOS-assigned windows from the Linux boot log of this
+     * machine (8086:9a0b):
+     *   pci 0000:00:0e.0: reg 0x10: [mem 0x6000000000-0x6001ffffff 64bit]
+     *   pci 0000:00:0e.0: reg 0x18: [mem 0x50000000-0x51ffffff]
+     *   pci 0000:00:0e.0: reg 0x20: [mem 0x6003100000-0x60031fffff 64bit]
+     *
+     * Apple writes the 64-bit BARs as if they were 32-bit (wrong/absent
+     * low dwords) and the child memory window (BAR2/MEMBAR1) must decode
+     * at 0x50000000 because the domain root bus resource IS that window
+     * (1:1 translation).  Rewrite every dword: BAR0 lo/hi, BAR2 (the real
+     * 32-bit MEMBAR1), BAR3 (unused), BAR4 lo/hi.
+     * ------------------------------------------------------------------ */
+    struct VMDBarFix { uint8_t reg; uint32_t value; const char *name; };
+    const VMDBarFix fixes[] = {
+        { kIOPCIConfigBaseAddress0,     0x00000000, "BAR0 lo (CFG BAR hi=0x60)" },
+        { kIOPCIConfigBaseAddress0 + 4, 0x00000060, "BAR0 hi" },
+        { kIOPCIConfigBaseAddress2,     0x50000000, "BAR2 lo (MEMBAR1 32MB)" },
+        { kIOPCIConfigBaseAddress2 + 4, 0x00000000, "BAR3 (unused)" },
+        { kIOPCIConfigBaseAddress4,     0x03100000, "BAR4 lo (MEMBAR2 hi=0x60)" },
+        { kIOPCIConfigBaseAddress4 + 4, 0x00000060, "BAR4 hi" },
+    };
+    for (unsigned i = 0; i < sizeof(fixes) / sizeof(fixes[0]); i++) {
+        uint32_t old = pciDevice->configRead32(fixes[i].reg);
+        if (old != fixes[i].value) {
+            pciDevice->configWrite32(fixes[i].reg, fixes[i].value);
+            IOLog("IntelVMD: fix host BAR reg 0x%02x: 0x%08x -> 0x%08x (%s)\n",
+                  fixes[i].reg, old, fixes[i].value, fixes[i].name);
+        }
+    }
 }
 
 bool VMDDriver::vmdProbe(IOService *provider)
@@ -1260,21 +1291,35 @@ bool VMDDriver::seedBridgeEntry(void)
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
  * postScanConfigure — per-device work after pci_scan_child_bus():
  *
- *   1. vmd_acpi_find_companion() for every device behind the VMD, so
+ *   1. vmd_domain_reset() — clear stale bridge windows (resetDomain()).
+ *   2. pci_assign_unassigned_bus_resources() + pci_setup_bridge() —
+ *      assignDomainResources(): program every BAR behind the VMD, re-open
+ *      each bridge's memory window around its children's live BARs, set
+ *      bus numbers and enable decode.  THIS STAGE IS WHAT MAKES CHILD MMIO
+ *      REACHABLE: resetDomain() alone leaves every window closed, config
+ *      space keeps working (it goes through the CFG BAR ECAM), and every
+ *      memory read returns all-1s — the "( CAP !=
+ *      kNVMeInvalidRegisterValue64 )" signature.
+ *   3. vmd_acpi_find_companion() for every device behind the VMD, so
  *      Apple's IONVMeFamily finds acpiRootDevice (the "big issue").
- *   2. vmd_pm_enable_quirk() — driver-default LTR values.
- *   3. child MSI wiring onto the VMD's own MSI-X vectors (irq demux).
- *   4. hot reset of each root port before touching its endpoints
- *      (Linux: pci_reset_bus() on the first child, propagated down).
+ *   4. vmd_pm_enable_quirk() — driver-default LTR values.
+ *   5. child MSI wiring onto the VMD's own MSI-X vectors (irq demux).
+ *   6. CAP probe on NVMe endpoints — reads NVMe CAP (BAR0+0) through a
+ *      fresh mapping and logs whether the decode chain is alive.
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void VMDDriver::postScanConfigure(void)
 {
     if (!fBridgeEntry) return;
 
+    // Linux vmd_enable_domain() order: pci_scan_child_bus() [done by
+    // kConfigOpScan] -> vmd_domain_reset() -> pci_assign_unassigned_bus_
+    // resources() -> per-device setup.
+    resetDomain();
+    assignDomainResources();
+
     for (IOPCIConfigEntry *child = fBridgeEntry->child; child; child = child->peer) {
         IOPCIDevice *nub = OSDynamicCast(IOPCIDevice, child->dtNub);
         if (!nub) continue;
-        if (nub->configRead16(kIOPCIConfigCommand) == 0) continue;
 
         // ACPI companion (vmd_acpi_find_companion)
         associateACPI(child, NULL);
@@ -1284,41 +1329,13 @@ void VMDDriver::postScanConfigure(void)
 
         wireChildMSI(nub);
 
+
         if (child->isBridge) {
-            // pci_reset_bus() analogue — Linux: pci_bus_save_and_disable(),
-            // pci_bridge_secondary_bus_reset(), pci_bus_restore().  The
-            // two-argument IOPCIDevice::reset() overload is not exported by
-            // IOPCIFamily (kmutil cannot bind it on macOS 13), so the reset
-            // bit is asserted in the root port's bridge control register by
-            // hand, with the endpoint's config space saved and restored
-            // around it (a bus reset zeroes BARs and the command register).
             IOPCIDevice *nub2 =
                 OSDynamicCast(IOPCIDevice, nub->getChildEntry(gIODTPlane));
             if (!nub2) continue;
             IOPCIConfigEntry *child2 = VMDChildDevice::configEntryOf(nub2);
             if (!child2) continue;
-
-            resetDomain();
-        /*
-            // pci_bus_save_and_disable()
-            uint32_t savedState[64];
-            for (int reg = 0; reg < 64; reg++)
-                savedState[reg] = nub2->configRead32(reg * 4);
-            // pci_bridge_secondary_bus_reset()
-            uint16_t bctl = nub->configRead16(PCI_BRIDGE_CONTROL);
-            nub->configWrite16(PCI_BRIDGE_CONTROL,
-                               bctl | PCI_BRIDGE_CTL_BUS_RESET);
-            IOSleep(2);
-            nub->configWrite16(PCI_BRIDGE_CONTROL,
-                               bctl & ~PCI_BRIDGE_CTL_BUS_RESET);
-
-            IOSleep(100);
-
-            // pci_bus_restore()
-            for (int reg = 0; reg < 64; reg++)
-                nub2->configWrite32(reg * 4, savedState[reg]);
-*/
-            if (nub2->configRead16(kIOPCIConfigCommand) == 0) continue;
 
             // Endpoints behind a VMD root port normally have no ACPI node
             // of their own (BIOS only declares the root ports).  Apple's
@@ -1332,12 +1349,480 @@ void VMDDriver::postScanConfigure(void)
 
             enableLTRQuirk(nub2);
             wireChildMSI(nub2);
-            
+
+            // pci_enable_device() — memory decode + bus mastering.
+            uint16_t cmdBefore = nub2->configRead16(kIOPCIConfigCommand);
+            nub2->setBusMasterEnable(true);
+            nub2->setMemoryEnable(true);
+            uint16_t cmdAfter = nub2->configRead16(kIOPCIConfigCommand);
+            IOLog("IntelVMD: endpoint %02x:%02x.%x cmd 0x%04x -> 0x%04x\n",
+                  nub2->space.s.busNum, nub2->space.s.deviceNum,
+                  nub2->space.s.functionNum, cmdBefore, cmdAfter);
+
             IOLog("IntelVMD: endpoint %02x:%02x.%x configured\n",
                   child2->space.s.busNum, child2->space.s.deviceNum,
                   child2->space.s.functionNum);
+
+            // Decisive check: read the NVMe CAP register (BAR0+0) through a
+            // fresh mapping.  "DECODE OK" here means the whole
+            // VMD -> root port -> endpoint memory path is alive and any
+            // later IONVMeFamily assert is a mapping/ownership issue.
+            capProbeDiagnostic(nub2);
         }
     }
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * pci_assign_unassigned_bus_resources() — port.
+ *
+ * Linux vmd_enable_domain():  pci_scan_child_bus() -> vmd_domain_reset()
+ * -> pci_assign_unassigned_bus_resources().  The VMD translates memory
+ * 1:1, so a child BAR is programmed with a plain host address inside the
+ * MEMBAR1 window (Linux dmesg of this machine:
+ *   pci 10000:e1:00.0: BAR 0: assigned [mem 0x50000000-0x50003fff 64bit]
+ *   pci 10000:e0:1c.4: bridge window [mem 0x50000000-0x500fffff]).
+ * Valid existing assignments (BIOS or IOPCIFamily, e.g. the 1 MB-aligned
+ * 0x50100000 IOPCIFamily gives the NVMe) are kept like Linux keeps
+ * BIOS-configured endpoints; stale/out-of-window values are reprogrammed
+ * from a 1 MB-granular cursor at the window start.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::assignDomainResources(void)
+{
+    if (!fBridgeEntry) return;
+
+    VMDAssignCtx ctx;
+    bzero(&ctx, sizeof(ctx));
+    for (uint32_t i = 0; i < fWindowCount; i++) {
+        if (fWindows[i].type == kIOPCIResourceTypeMemory) {
+            ctx.memWinStart = fWindows[i].start;
+            ctx.memWinSize  = fWindows[i].size;
+        } else if (fWindows[i].type == kIOPCIResourceTypePrefetchMemory) {
+            ctx.pfWinStart  = fWindows[i].start;
+            ctx.pfWinSize   = fWindows[i].size;
+        }
+    }
+    if (!ctx.memWinSize) {
+        IOLog("IntelVMD: assign: MEMBAR1 window unknown, cannot assign\n");
+        return;
+    }
+    ctx.memCursor = ctx.memWinStart;
+    ctx.pfCursor  = ctx.pfWinStart;
+
+    IOLog("IntelVMD: assign: mem window 0x%llx-0x%llx, pf window 0x%llx-0x%llx\n",
+          (unsigned long long)ctx.memWinStart,
+          (unsigned long long)(ctx.memWinStart + ctx.memWinSize - 1),
+          (unsigned long long)ctx.pfWinStart,
+          (unsigned long long)(ctx.pfWinStart + ctx.pfWinSize - 1));
+
+    // Depth-first over every device behind the VMD.  'this' is the root
+    // bus nub (its DT children are the bus 0xE0 devices).
+    assignBusDevices(this, &ctx);
+}
+
+void VMDDriver::assignBusDevices(IORegistryEntry *busNub, VMDAssignCtx *ctx)
+{
+    OSIterator *iter = busNub->getChildIterator(gIODTPlane);
+    if (!iter) return;
+    iter->reset();
+
+    IORegistryEntry *entry;
+    while ((entry = (IORegistryEntry *)iter->getNextObject())) {
+        IOPCIDevice *nub = OSDynamicCast(IOPCIDevice, entry);
+        if (!nub) continue;
+        if (nub->configRead16(kIOPCIConfigVendorID) == 0xFFFF) continue;
+
+        assignDeviceBars(nub, ctx);
+
+        uint8_t hdr = nub->configRead8(PCI_HEADER_TYPE) & PCI_HEADER_TYPE_MASK;
+        if (hdr == PCI_HEADER_TYPE_BRIDGE) {
+            // Depth first (pci_assign_unassigned_bus_resources walks each
+            // bus bottom-up): a bridge's window is computed from its
+            // children's addresses, so assign below it first.
+            assignBusDevices(nub, ctx);
+            configureBridgeWindows(nub, ctx);
+        }
+    }
+    iter->release();
+}
+
+void VMDDriver::assignDeviceBars(IOPCIDevice *nub, VMDAssignCtx *ctx)
+{
+    uint8_t  hdr      = nub->configRead8(PCI_HEADER_TYPE) & PCI_HEADER_TYPE_MASK;
+    uint32_t barCount = (hdr == PCI_HEADER_TYPE_BRIDGE) ? 2 : 6;
+
+    for (uint32_t b = 0; b < barCount; b++) {
+        uint32_t reg = kIOPCIConfigBaseAddress0 + b * 4;
+        uint32_t low = nub->configRead32(reg);
+        if (low == 0xFFFFFFFF) continue;
+        if (low & 0x1) continue;                        // I/O BAR: no I/O window in a VMD domain
+        bool is64 = ((low & 0x6) == 0x4);
+        bool isPF = (low & 0x8) != 0;
+        if (is64 && b + 1 >= barCount) continue;        // would overlap bridge regs
+        uint32_t idx = b;                               // cache index of this BAR
+
+        uint64_t addr = low & 0xFFFFFFF0ULL;
+        if (is64) addr |= ((uint64_t)nub->configRead32(reg + 4) << 32);
+        if (is64) b++;      // next dword is this BAR's upper half, not another BAR
+
+        // Size: trust the family-probed range when present, else probe the
+        // hardware (Linux pci_size()).
+        uint64_t size = 0;
+        IODeviceMemory *fam = nub->getDeviceMemoryWithRegister(reg);
+        if (fam) size = fam->getLength();
+        if (!size) size = probeBarSize(nub, reg, is64);
+        if (!size) continue;
+
+        // Remember the size for the child's live-decode accessor — BAR sizes
+        // are only probed here, while no driver is mapped to the device yet.
+        VMDChildDevice *child = OSDynamicCast(VMDChildDevice, nub);
+        if (child) child->fBarSize[idx] = size;
+
+        uint64_t winStart = isPF ? ctx->pfWinStart : ctx->memWinStart;
+        uint64_t winSize  = isPF ? ctx->pfWinSize  : ctx->memWinSize;
+        bool inWin = winSize && addr
+                  && addr >= winStart
+                  && (addr - winStart) + size <= winSize;
+
+        if (inWin) {
+            // Valid assignment (BIOS or IOPCIFamily) — keep it.  Linux:
+            // "Endpoints must be initially configured by platform BIOS"
+            // (vmd_enable_device) — in-window BARs are never reprogrammed.
+            ctx->keep(addr, size);
+            IOLog("IntelVMD: %02x:%02x.%x BAR%u keep 0x%llx/0x%llx%s\n",
+                  nub->space.s.busNum, nub->space.s.deviceNum,
+                  nub->space.s.functionNum, idx,
+                  (unsigned long long)addr, (unsigned long long)size,
+                  is64 ? " 64bit" : "");
+            continue;
+        }
+
+        // Unassigned or decodes outside the VMD windows (stale high dword
+        // from a 32-bit BAR write, IOPCIFamily allocation elsewhere, or a
+        // bus reset that cleared the BAR) — program it inside the window.
+        uint64_t cand = allocFromWindow(ctx, size, isPF);
+        if (!cand) {
+            IOLog("IntelVMD: %02x:%02x.%x BAR%u: no space for size 0x%llx "
+                  "(stale 0x%llx)\n",
+                  nub->space.s.busNum, nub->space.s.deviceNum,
+                  nub->space.s.functionNum, idx,
+                  (unsigned long long)size, (unsigned long long)addr);
+            continue;
+        }
+
+        uint32_t oldLo = low;
+        uint32_t oldHi = is64 ? nub->configRead32(reg + 4) : 0;
+        nub->configWrite32(reg, (uint32_t)(cand & 0xFFFFFFF0ULL));
+        if (is64) nub->configWrite32(reg + 4, (uint32_t)(cand >> 32));
+        ctx->keep(cand, size);
+        IOLog("IntelVMD: %02x:%02x.%x BAR%u 0x%08x%08x -> 0x%08x%08x /0x%llx\n",
+              nub->space.s.busNum, nub->space.s.deviceNum,
+              nub->space.s.functionNum, idx,
+              oldHi, oldLo,
+              (uint32_t)(cand >> 32), (uint32_t)(cand & 0xFFFFFFF0ULL),
+              (unsigned long long)size);
+    }
+
+    // Rebuild the nub's published IODeviceMemory so every later map (base
+    // class getter, index getters, AppleNVMe) agrees with live hardware.
+    refreshNubDeviceMemory(nub);
+}
+
+uint64_t VMDDriver::probeBarSize(IOPCIDevice *nub, uint32_t reg, bool is64)
+{
+    uint32_t oldLo = nub->configRead32(reg);
+    uint32_t maskLo, maskHi = 0;
+
+    if (!is64) {
+        nub->configWrite32(reg, 0xFFFFFFF0);
+        maskLo = nub->configRead32(reg);
+        nub->configWrite32(reg, oldLo);
+        if (maskLo == 0 || maskLo == 0xFFFFFFFF) return 0;
+        uint32_t mask = maskLo & 0xFFFFFFF0U;
+        return ((uint64_t)(~mask)) + 1;     /* complement in 32 bits, then widen */
+    }
+
+    uint32_t oldHi = nub->configRead32(reg + 4);
+    nub->configWrite32(reg,     0xFFFFFFF0);
+    nub->configWrite32(reg + 4, 0xFFFFFFFF);
+    maskLo = nub->configRead32(reg);
+    maskHi = nub->configRead32(reg + 4);
+    nub->configWrite32(reg + 4, oldHi);
+    nub->configWrite32(reg,     oldLo);
+
+    uint64_t mask = ((uint64_t)maskHi << 32) | (maskLo & 0xFFFFFFF0ULL);
+    if (!mask) return 0;
+    return (~mask) + 1;
+}
+
+uint64_t VMDDriver::allocFromWindow(VMDAssignCtx *ctx, uint64_t size, bool isPF)
+{
+    uint64_t &cursor   = isPF ? ctx->pfCursor   : ctx->memCursor;
+    uint64_t winStart  = isPF ? ctx->pfWinStart : ctx->memWinStart;
+    uint64_t winSize   = isPF ? ctx->pfWinSize  : ctx->memWinSize;
+
+    if (!winSize || !size) return 0;
+
+    while (cursor + size <= winStart + winSize) {
+        // Apple- and Linux-like 1 MB granularity; natural alignment for
+        // anything larger.
+        uint64_t align = size > 0x100000 ? size : 0x100000;
+        uint64_t cand  = (cursor + align - 1) & ~(align - 1);
+        if (cand + size > winStart + winSize) return 0;
+        if (!ctx->overlaps(cand, cand + size)) {
+            cursor = cand + size;
+            return cand;
+        }
+        // Bump past the clashing kept allocation.
+        uint64_t bump = 0;
+        for (uint32_t i = 0; i < ctx->keptCount; i++)
+            if (cand < ctx->kept[i].end && ctx->kept[i].start < cand + size)
+                if (ctx->kept[i].end > bump) bump = ctx->kept[i].end;
+        if (!bump) return 0;
+        cursor = bump;
+    }
+    return 0;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * pci_setup_bridge() — port.  Programs the bridge windows from the live
+ * BAR addresses of everything behind the bridge, plus bus numbers and the
+ * bridge command.  This is the stage vmd_domain_reset() depends on: the
+ * reset closes all windows, this re-opens them.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::configureBridgeWindows(IOPCIDevice *bridge, VMDAssignCtx *ctx)
+{
+    uint64_t memMin = ~0ULL, memMax = 0, pfMin = ~0ULL, pfMax = 0;
+    collectDescendantRanges(bridge, &memMin, &memMax, &pfMin, &pfMax);
+
+    // Memory window — 1 MB granularity (PCI_MEMORY_BASE 0x20 / LIMIT 0x22,
+    // registers hold address bits 31:20).
+    if (memMax > memMin) {
+        uint32_t base20 = (uint32_t)(memMin >> 20);
+        uint32_t lim20  = (uint32_t)((memMax - 1) >> 20);
+        bridge->configWrite16(PCI_MEMORY_BASE,     (uint16_t)base20);
+        bridge->configWrite16(PCI_MEMORY_BASE + 2, (uint16_t)lim20);
+        IOLog("IntelVMD: bridge %02x:%02x.%x mem window 0x%08x-0x%08x\n",
+              bridge->space.s.busNum, bridge->space.s.deviceNum,
+              bridge->space.s.functionNum,
+              base20 << 20, (lim20 << 20) | 0xFFFFF);
+    } else {
+        bridge->configWrite32(PCI_MEMORY_BASE, 0x0000fff0);   // closed
+    }
+
+    // I/O window stays closed — a VMD domain has no I/O space
+    // (Linux: "BAR 13: failed to assign [io size 0x1000]").
+    bridge->configWrite8(PCI_IO_BASE,     0xf0);
+    bridge->configWrite8(PCI_IO_BASE + 1, 0x00);
+    bridge->configWrite32(PCI_IO_BASE_UPPER16, 0);
+
+    // Prefetchable window — opened only when a child actually decodes into
+    // the MEMBAR2 region (64-bit encoding, bits 31:20 in 0x24/0x26, upper
+    // dwords at 0x28/0x2c).
+    if (pfMax > pfMin) {
+        uint64_t pBase = pfMin & ~0xFFFFFULL;
+        uint64_t pEnd  = (pfMax + 0xFFFFF) & ~0xFFFFFULL;
+        bridge->configWrite16(PCI_PREF_MEMORY_BASE,
+                 (uint16_t)(((uint32_t)(pBase >> 20) & 0xFFF) | 0x1));
+        bridge->configWrite16(PCI_PREF_MEMORY_BASE + 2,
+                 (uint16_t)(((uint32_t)((pEnd - 1) >> 20) & 0xFFF) | 0x1));
+        bridge->configWrite32(PCI_PREF_BASE_UPPER32,  (uint32_t)(pBase >> 32));
+        bridge->configWrite32(PCI_PREF_LIMIT_UPPER32,
+                              (uint32_t)((pEnd - 1) >> 32));
+        IOLog("IntelVMD: bridge %02x:%02x.%x pf window 0x%llx-0x%llx\n",
+              bridge->space.s.busNum, bridge->space.s.deviceNum,
+              bridge->space.s.functionNum,
+              (unsigned long long)pBase, (unsigned long long)pEnd);
+    } else {
+        bridge->configWrite32(PCI_PREF_LIMIT_UPPER32, 0);
+        bridge->configWrite32(PCI_PREF_MEMORY_BASE,   0x0000fff0);
+        bridge->configWrite32(PCI_PREF_BASE_UPPER32,  0xffffffff);
+    }
+
+    // Bus numbers.  VMD root ports hard-wire the primary bus to 0 ("Primary
+    // bus is hard wired to 0" in Linux dmesg); secondary must cover the
+    // child bus and subordinate the rest of the VMD domain.
+    IOPCIDevice *fnub =
+        OSDynamicCast(IOPCIDevice, bridge->getChildEntry(gIODTPlane));
+    if (fnub) {
+        uint8_t childBus = fnub->space.s.busNum;
+        uint8_t sec      = bridge->configRead8(0x19);
+        bridge->configWrite8(0x18, 0x00);          // primary (hardwired 0)
+        bridge->configWrite8(0x19, childBus);      // secondary
+        bridge->configWrite8(0x1a, fBusnEnd);      // subordinate
+        if (sec != childBus)
+            IOLog("IntelVMD: bridge %02x:%02x.%x secondary bus 0x%02x -> 0x%02x\n",
+                  bridge->space.s.busNum, bridge->space.s.deviceNum,
+                  bridge->space.s.functionNum, sec, childBus);
+    }
+
+    // Bridge command: memory decode + bus master so TLPs are forwarded.
+    uint16_t cmd  = bridge->configRead16(kIOPCIConfigCommand);
+    uint16_t want = cmd | kIOPCICommandMemorySpace | kIOPCICommandBusMaster;
+    if (want != cmd) {
+        bridge->configWrite16(kIOPCIConfigCommand, want);
+        IOLog("IntelVMD: bridge %02x:%02x.%x cmd 0x%04x -> 0x%04x\n",
+              bridge->space.s.busNum, bridge->space.s.deviceNum,
+              bridge->space.s.functionNum, cmd, want);
+    }
+
+    refreshNubDeviceMemory(bridge);
+}
+
+void VMDDriver::collectDescendantRanges(IORegistryEntry *busNub,
+                                        uint64_t *memMin, uint64_t *memMax,
+                                        uint64_t *pfMin,  uint64_t *pfMax)
+{
+    OSIterator *iter = busNub->getChildIterator(gIODTPlane);
+    if (!iter) return;
+    iter->reset();
+
+    IORegistryEntry *entry;
+    while ((entry = (IORegistryEntry *)iter->getNextObject())) {
+        IOPCIDevice *nub = OSDynamicCast(IOPCIDevice, entry);
+        if (!nub) continue;
+        if (nub->configRead16(kIOPCIConfigVendorID) == 0xFFFF) continue;
+
+        uint8_t  hdr      = nub->configRead8(PCI_HEADER_TYPE) & PCI_HEADER_TYPE_MASK;
+        uint32_t barCount = (hdr == PCI_HEADER_TYPE_BRIDGE) ? 2 : 6;
+
+        for (uint32_t b = 0; b < barCount; b++) {
+            uint32_t reg = kIOPCIConfigBaseAddress0 + b * 4;
+            uint32_t low = nub->configRead32(reg);
+            if (low == 0xFFFFFFFF || (low & 0x1)) continue;
+            bool is64 = ((low & 0x6) == 0x4);
+            uint64_t addr = low & 0xFFFFFFF0ULL;
+            if (is64) addr |= ((uint64_t)nub->configRead32(reg + 4) << 32);
+            if (!addr) continue;
+
+            uint64_t size = 0;
+            IODeviceMemory *fam = nub->getDeviceMemoryWithRegister(reg);
+            if (fam) size = fam->getLength();
+            if (!size) size = probeBarSize(nub, reg, is64);
+            if (!size) continue;
+            uint64_t end = addr + size;
+
+            if (inVMDWindow(addr, end, false)) {
+                if (addr < *memMin) *memMin = addr;
+                if (end > *memMax)  *memMax = end;
+            } else if (inVMDWindow(addr, end, true)) {
+                if (addr < *pfMin) *pfMin = addr;
+                if (end > *pfMax)  *pfMax = end;
+            }
+        }
+
+        if (hdr == PCI_HEADER_TYPE_BRIDGE)
+            collectDescendantRanges(nub, memMin, memMax, pfMin, pfMax);
+    }
+    iter->release();
+}
+
+bool VMDDriver::inVMDWindow(uint64_t begin, uint64_t end, bool prefetch)
+{
+    for (uint32_t i = 0; i < fWindowCount; i++) {
+        bool isPF = (fWindows[i].type == kIOPCIResourceTypePrefetchMemory);
+        if (isPF != prefetch) continue;
+        if (begin >= fWindows[i].start &&
+            end - 1 <= fWindows[i].start + fWindows[i].size - 1)
+            return true;
+    }
+    return false;
+}
+
+/* Rebuild a nub's published IODeviceMemory array from the LIVE config BARs
+ * (addresses may have just been reprogrammed; sizes come from the
+ * family-probed ranges).  Keeps the stock index-based accessors and Apple's
+ * save/restore consistent with hardware. */
+void VMDDriver::refreshNubDeviceMemory(IOPCIDevice *nub)
+{
+    uint8_t  hdr      = nub->configRead8(PCI_HEADER_TYPE) & PCI_HEADER_TYPE_MASK;
+    uint32_t barCount = (hdr == PCI_HEADER_TYPE_BRIDGE) ? 2 : 6;
+
+    IODeviceMemory::InitElement ranges[6];
+    uint32_t n = 0;
+
+    for (uint32_t b = 0; b < barCount; b++) {
+        uint32_t reg = kIOPCIConfigBaseAddress0 + b * 4;
+        uint32_t low = nub->configRead32(reg);
+        if (low == 0xFFFFFFFF || (low & 0x1)) continue;
+        bool is64 = ((low & 0x6) == 0x4);
+        uint64_t addr = low & 0xFFFFFFF0ULL;
+        if (is64) addr |= ((uint64_t)nub->configRead32(reg + 4) << 32);
+        if (!addr) continue;
+
+        IODeviceMemory *fam = nub->getDeviceMemoryWithRegister(reg);
+        uint64_t len = fam ? fam->getLength() : 0;
+        if (!len) continue;
+
+        IOPCIAddressSpace as = nub->space;
+        as.s.space       = (is64 || (addr >> 32)) ? kIOPCI64BitMemorySpace
+                                                  : kIOPCI32BitMemorySpace;
+        as.s.registerNum = reg;
+        as.s.reloc       = 1;
+
+        ranges[n].start  = addr;
+        ranges[n].length = len;
+        ranges[n].tag    = as.bits;
+        n++;
+    }
+    if (!n) return;
+
+    OSArray *array = IODeviceMemory::arrayFromList(ranges, n);
+    if (!array) return;
+    nub->setDeviceMemory(array);
+    array->release();
+    IOLog("IntelVMD: %02x:%02x.%x device memory refreshed (%u ranges)\n",
+          nub->space.s.busNum, nub->space.s.deviceNum,
+          nub->space.s.functionNum, n);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * CAP probe — read NVMe CAP (BAR0+0, the exact register behind the
+ * "( CAP != kNVMeInvalidRegisterValue64 )" assert) through a fresh mapping
+ * of the live BAR0 decode address.  Distinguishes a dead decode chain
+ * (all-1s = master abort, all-0s = unmapped) from a healthy controller.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::capProbeDiagnostic(IOPCIDevice *nub)
+{
+    if (nub->configRead16(PCI_CLASS_DEVICE) != 0x0108) return;   // NVMe only
+
+    uint32_t barLo = nub->configRead32(kIOPCIConfigBaseAddress0);
+    uint32_t barHi = nub->configRead32(kIOPCIConfigBaseAddress0 + 4);
+    uint16_t cmd   = nub->configRead16(kIOPCIConfigCommand);
+
+    IODeviceMemory *mem = nub->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    if (!mem) {
+        IOLog("IntelVMD: CAP probe %02x:%02x.%x: NO IODeviceMemory for BAR0 "
+              "(bar 0x%08x%08x cmd 0x%04x)\n",
+              nub->space.s.busNum, nub->space.s.deviceNum,
+              nub->space.s.functionNum, barHi, barLo, cmd);
+        return;
+    }
+
+    uint64_t phys = mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+    IOMemoryMap *map = mem->map(kIOMapAnywhere);
+    if (!map) {
+        IOLog("IntelVMD: CAP probe %02x:%02x.%x: map failed @0x%llx\n",
+              nub->space.s.busNum, nub->space.s.deviceNum,
+              nub->space.s.functionNum, (unsigned long long)phys);
+        mem->release();                 // +1 from getDeviceMemoryWithRegister
+        return;
+    }
+
+    volatile uint32_t *regs = (volatile uint32_t *)map->getVirtualAddress();
+    uint32_t capLo = OSReadLittleInt32(regs, 0);
+    uint32_t capHi = OSReadLittleInt32(regs, 4);
+    uint16_t vs    = (uint16_t)OSReadLittleInt32(regs, 8);   // VS register
+    map->release();
+    mem->release();                     // +1 from getDeviceMemoryWithRegister
+
+    bool dead = (capLo == 0xFFFFFFFF && capHi == 0xFFFFFFFF)
+             || (capLo == 0x00000000 && capHi == 0x00000000);
+    IOLog("IntelVMD: CAP probe %02x:%02x.%x BAR0 0x%08x%08x -> phys 0x%llx: "
+          "CAP 0x%08x%08x VS 0x%04x cmd 0x%04x — %s\n",
+          nub->space.s.busNum, nub->space.s.deviceNum, nub->space.s.functionNum,
+          barHi, barLo, (unsigned long long)phys,
+          capHi, capLo, vs, cmd,
+          dead ? "DECODE DEAD" : "DECODE OK");
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -1676,6 +2161,93 @@ void VMDDriver::handleBridgeInterrupt(OSObject * /* owner */,
  * VMDChildDevice helpers.
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+bool VMDChildDevice::init(OSDictionary *properties)
+{
+    for (uint32_t i = 0; i < 6; i++) { fFixedMemory[i] = NULL; fBarSize[i] = 0; }
+    return IOPCIDevice::init(properties);
+}
+
+/* Live-decode BAR accessor.
+ *
+ * The stock IOPCIDevice::getDeviceMemoryWithRegister returns the
+ * IODeviceMemory IOPCIFamily constructed from the BAR values it saw during
+ * its scan.  Behind a VMD the effective decode address is whatever is in
+ * config space RIGHT NOW (BIOS value, IOPCIFamily allocation, our assign
+ * stage, or a re-write after a bus reset) — and IONVMeController maps BAR0
+ * through this accessor to read CAP/CSTS.  A stale range here silently
+ * redirects every NVMe register access into dead host memory and produces
+ * "( CAP != kNVMeInvalidRegisterValue64 )".
+ *
+ * This override re-reads the BAR from live config space (through the VMD
+ * ECAM) and, when the live address differs from the family range, hands
+ * out a corrected IODeviceMemory of the same size.  When both agree the
+ * stock range is returned untouched. */
+IODeviceMemory * VMDChildDevice::getDeviceMemoryWithRegister( UInt8 reg )
+{
+    if (reg >= kIOPCIConfigBaseAddress0 && reg <= kIOPCIConfigBaseAddress5) {
+        uint32_t low = configRead32(this->space,reg);
+        if (low != 0xFFFFFFFF && !(low & 0x1)) {
+            uint32_t idx = (reg - kIOPCIConfigBaseAddress0) / 4;
+            bool     is64 = ((low & 0x6) == 0x4);
+            uint64_t addr = low & 0xFFFFFFF0ULL;
+            if (is64 && reg <= kIOPCIConfigBaseAddress4)
+                addr |= ((uint64_t)configRead32(this->space,reg + 4) << 32);
+
+            IODeviceMemory *family =
+                IOPCIDevice::getDeviceMemoryWithRegister(reg);      // +1
+            if (family) {
+                uint64_t famAddr =
+                    family->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+                if (famAddr == addr || !addr)
+                    return family;              // consistent — stock range
+            }
+
+            /* Length: the size we recorded while assigning BARs is the
+             * ground truth; the family range length is the fallback. */
+            uint64_t len = (idx < 6) ? fBarSize[idx] : 0;
+            if (!len && family) len = family->getLength();
+
+            IODeviceMemory *result = NULL;
+            if (addr && len) {
+                IODeviceMemory *fixed = fFixedMemory[idx];
+                if (fixed && fixed->getPhysicalSegment(
+                                 0, NULL, kIOMemoryMapperNone) == addr) {
+                    result = fixed;             // cached, still live
+                } else {
+                    if (fixed) {
+                        fixed->release();       // drop stale cached range
+                        fFixedMemory[idx] = NULL;
+                    }
+                    fixed = IODeviceMemory::withRange(
+                                (IOPhysicalAddress)addr,
+                                (IOPhysicalLength)len);
+                    if (fixed) {
+                        fFixedMemory[idx] = fixed;  /* nub keeps one ref */
+                        IOLog("IntelVMD: %02x:%02x.%x reg 0x%02x live BAR "
+                              "0x%llx len 0x%llx (family 0x%llx/0x%llx) — "
+                              "using live decode address\n",
+                              space.s.busNum, space.s.deviceNum,
+                              space.s.functionNum, reg,
+                              (unsigned long long)addr,
+                              (unsigned long long)len,
+                              family ? (unsigned long long)
+                                  family->getPhysicalSegment(
+                                      0, NULL, kIOMemoryMapperNone)
+                                     : 0ULL,
+                              family ? (unsigned long long)
+                                  family->getLength() : 0ULL);
+                    }
+                    result = fixed;
+                }
+                if (result) result->retain();   /* caller owns this ref */
+            }
+            if (family) family->release();      /* our lookup ref */
+            if (result) return result;
+        }
+    }
+    return IOPCIDevice::getDeviceMemoryWithRegister(reg);
+}
+
 IOWorkLoop * VMDChildDevice::getWorkLoop(void) const
 {
     if (pvmd) return pvmd->getWorkLoop();
@@ -1684,6 +2256,12 @@ IOWorkLoop * VMDChildDevice::getWorkLoop(void) const
 
 void VMDChildDevice::free(void)
 {
+    for (uint32_t i = 0; i < 6; i++) {
+        if (fFixedMemory[i]) {
+            fFixedMemory[i]->release();
+            fFixedMemory[i] = NULL;
+        }
+    }
     IOService::free();
 }
 
