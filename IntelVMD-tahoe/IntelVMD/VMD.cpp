@@ -1299,6 +1299,8 @@ void VMDDriver::postScanConfigure(void)
             if (!child2) continue;
 
             resetDomain();
+            IOSleep(100);
+            
         /*
             // pci_bus_save_and_disable()
             uint32_t savedState[64];
@@ -1318,6 +1320,7 @@ void VMDDriver::postScanConfigure(void)
             for (int reg = 0; reg < 64; reg++)
                 nub2->configWrite32(reg * 4, savedState[reg]);
 */
+                
             if (nub2->configRead16(kIOPCIConfigCommand) == 0) continue;
 
             // Endpoints behind a VMD root port normally have no ACPI node

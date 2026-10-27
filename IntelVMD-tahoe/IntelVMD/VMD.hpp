@@ -187,13 +187,13 @@ public:
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
     virtual void free(void) override;
-    virtual IOWorkLoop * getWorkLoop(void) const ;
+    virtual IOWorkLoop * getWorkLoop(void) const override;
 
     /* IOPCIBridge */
     virtual UInt8 firstBusNum(void) override;
     virtual UInt8 lastBusNum(void) override;
     virtual IOPCIAddressSpace getBridgeSpace(void) override;
-    virtual IOPCIDevice * createNub(OSDictionary *from) ;
+    virtual IOPCIDevice * createNub(OSDictionary *from) override;
 
     /* Linux vmd_ops — ECAM config access (vmd_pci_read/vmd_pci_write). */
     virtual UInt32 configRead32(IOPCIAddressSpace space, UInt8 offset) override;
@@ -208,10 +208,10 @@ public:
 
     virtual UInt32 findPCICapability(IOPCIAddressSpace space,
                                      UInt8 capabilityID,
-                                     UInt8 *offset = 0) ;
+                                     UInt8 *offset = 0) override;
     virtual UInt32 extendedFindPCICapability(IOPCIAddressSpace space,
                                              UInt32 capabilityID,
-                                             IOByteCount *offset = 0) ;
+                                             IOByteCount *offset = 0) override;
 
     /* Linux vmd_domain_reset() */
     void resetDomain(void);
