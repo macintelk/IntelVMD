@@ -29,7 +29,7 @@
 			<key>IOClass</key>
 			<string>VMDDriver</string>
 			<key>IONameMatch</key>
-			<string>pci8086,201d pci8086,28c0 pci8086,28c1 pci8086,467f pci8086,4c3d pci8086,9a0b pci8086,a77f pci8086,7d0b pci8086,ad0b pci8086,b60b pci8086,b06f pci8086,b07f pci8086,d70b pci8086,d73b VMD0</string>
+			<string>VMD0</string>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 		</dict>
