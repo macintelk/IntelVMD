@@ -218,6 +218,12 @@ public:
 
     inline volatile uint8_t * cfgBar(void) const { return fCfgBar; }
     inline uint8_t busnStart(void) const { return fBusnStart; }
+    void configure1( IOService * provider );
+    void configurePCISpace(const char *propName, IOService *pciDevice,
+                           IOPCIAddressSpace addrSpace,
+                           UInt64 address,
+                           UInt64 length);
+    
 };
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *

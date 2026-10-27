@@ -679,20 +679,243 @@ bool VMDDriver::setupMSIX(void)
     return true;
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * vmd_probe() — Linux probe flow.
- *
- *   pcim_enable_device + pci_set_master   -> open + setMemory/BusMasterEnable
- *   pcim_iomap(VMD_CFGBAR)                -> decodeAndPublishBars() + map
- *   vmd_prepare_offsets_and_bus()         -> getBusInfoFromBar4 /
- *                                            getPhysOffsets /
- *                                            getBusNumberStart
- *   vmd_alloc_irqs()                      -> setupMSIX()
- *   vmd_set_msi_remapping(true)           -> setMSIRemapping(true)
- *   pci_add_resource(bus/mem/pfmem)       -> addBridgeMemoryRange /
- *                                            addBridgePrefetchableMemoryRange
- *   pci_create_root_bus(busn_start)       -> fBridgeSpace + first/lastBusNum
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+void VMDDriver::configurePCISpace(const char *propName, IOService *pciDevice,
+                       IOPCIAddressSpace addrSpace,
+                       UInt64 address,
+                       UInt64 length)
+{
+    bool isExtended = addrSpace.s.t;
+    UInt8 spaceType = addrSpace.s.space;
+    UInt32 regOffset;
+
+    
+    if(isExtended) {
+        addrSpace.es.registerNumExtended=(uint32_t)address;
+        regOffset = addrSpace.es.registerNum;
+    } else {
+        regOffset = addrSpace.s.registerNum;
+    }
+    
+    addrSpace.s.reloc=1;
+    if (!address ) addrSpace.s.reloc=0;
+    if (!strcmp(propName,"ranges")) addrSpace.s.reloc=1;
+    
+    if (address) {
+        if(spaceType != kIOPCIConfigSpace) {
+            if(spaceType == kIOPCIIOSpace) {
+                UInt32 ioValue = (static_cast<UInt32>(address) & 0xFFFFFFFC) | 0x1;
+               // pciDevice->configWrite32(regOffset, (ioValue));
+            } else {
+                UInt32 addressLo = static_cast<UInt32>(address & 0xFFFFFFFF);
+                UInt32 addressHi = static_cast<UInt32>(address >> 32);
+                
+                addressLo &= ~0xF;
+                
+                if(addrSpace.s.prefetch) {
+                    addressLo |= 0x8;
+                }
+                
+                switch(spaceType) {
+                    case kIOPCI32BitMemorySpace:
+                        addressLo |= 0x0;
+                        break;
+                    case kIOPCI64BitMemorySpace:
+                        addressLo |= 0x4;
+                        break;
+                    default:
+                        break;
+                }
+                
+                
+               // pciDevice->configWrite32(regOffset, (addressLo));
+                if (spaceType == kIOPCI64BitMemorySpace) {
+                  //  pciDevice->configWrite32(regOffset + 4,0xFFFFFFFF);
+                   // pciDevice->configWrite32(regOffset + 4, (addressHi));
+                }
+            }
+        }
+    }
+
+    
+    if(spaceType == kIOPCI64BitMemorySpace) addrSpace.s.space =kIOPCI32BitMemorySpace;
+    
+    UInt32 configEntry[5];
+    configEntry[0] = (addrSpace.bits);
+    
+    if(spaceType == kIOPCIIOSpace && address==0) {
+        configEntry[1] = 0;
+        configEntry[2] = 0;
+    } else {
+        configEntry[1] = (static_cast<UInt32>(address >> 32));
+        configEntry[2] = (static_cast<UInt32>(address & 0xFFFFFFFF));
+    }
+    configEntry[3] = (static_cast<UInt32>(length >> 32));
+    configEntry[4] = (static_cast<UInt32>(length & 0xFFFFFFFF));
+
+    OSData *existing = OSDynamicCast(OSData, pciDevice->getProperty(propName));
+    OSData *updated = existing ? OSData::withData(existing) : OSData::withCapacity(0);
+    
+    if(updated) {
+        updated->appendBytes(configEntry, sizeof(configEntry));
+        pciDevice->setProperty(propName, updated);
+        updated->release();
+    }
+
+}
+
+void VMDDriver::configure1( IOService * provider )
+{
+    //setProperty("domain-id", 0x10000,32);
+    
+    IOPCIDevice* pciDevice = OSDynamicCast(IOPCIDevice, provider);
+    
+    if (!pciDevice) return;
+    
+    uint16_t reg0;
+    uint16_t busStart,busEnd;
+    
+    reg0=pciDevice->configRead16(   PCI_REG_VMCAP);
+    if (BUS_RESTRICT_CAP(reg0)) {
+        reg0=pciDevice->configRead16( PCI_REG_VMCONFIG);
+        
+        switch (BUS_RESTRICT_CFG(reg0)) {
+            case 0:
+                busStart = 0;
+                break;
+            case 1:
+                busStart = 128;
+                break;
+            case 2:
+                busStart = 224;
+                break;
+            default:
+                busStart=0;
+        }
+    }
+    
+    busEnd=0xFF;
+    
+    
+    bool enable=true;
+    reg0=pciDevice->configRead16( PCI_REG_VMCONFIG);
+    reg0 = enable ? (reg0 & ~VMCONFIG_MSI_REMAP) :
+    (reg0 | VMCONFIG_MSI_REMAP);
+    pciDevice->configWrite16( PCI_REG_VMCONFIG, reg0);
+    
+    
+    IOPCIAddressSpace space;
+    space.s.busNum = busStart;
+    
+    IOPCIAddressSpace aBridgeSpace=space;
+    
+    provider->removeProperty("reg");
+    provider->removeProperty("assigned-addresses");
+    provider->removeProperty("IODeviceMemory");
+    
+    IOPCIAddressSpace addrSpace=pciDevice->space;
+    UInt64 address;
+    UInt64 length;
+    
+    
+    address=0;
+    length=0;
+    addrSpace.s.space=kIOPCIConfigSpace;
+    addrSpace.s.registerNum=0x0;
+    configurePCISpace("reg", provider,addrSpace,address,length);
+    
+    address=0;
+    length=0x2000000;
+    addrSpace.s.space=kIOPCI64BitMemorySpace;
+    addrSpace.s.registerNum=0x10;
+    configurePCISpace("reg", provider,addrSpace,address,length);
+    
+    /*address=0;
+     length=0;
+     addrSpace.s.space=kIOPCI32BitMemorySpace;
+     addrSpace.s.registerNum=0x14;
+     configurePCISpace("reg", provider,addrSpace,address,length);*/
+    
+    address=0;
+    length=0x2000000;
+    addrSpace.s.space=kIOPCI32BitMemorySpace;
+    addrSpace.s.registerNum=0x18;
+    configurePCISpace("reg", provider,addrSpace,address,length);
+    
+    /*address=0;
+     length=0;
+     addrSpace.s.space=kIOPCI32BitMemorySpace;
+     addrSpace.s.registerNum=0x1c;
+     configurePCISpace("reg", provider,addrSpace,address,length);*/
+    
+    address=0;
+    length=0x100000;
+    // length=0x100000-0x2000;
+    addrSpace.s.space=kIOPCI64BitMemorySpace;
+    addrSpace.s.registerNum=0x20;
+    configurePCISpace("reg", provider,addrSpace,address,length);
+    
+    /*address=0;
+     length=0;
+     addrSpace.s.space=kIOPCI32BitMemorySpace;
+     addrSpace.s.registerNum=0x24;
+     configurePCISpace("reg", provider,addrSpace,address,length);*/
+    
+    
+    IODeviceMemory::InitElement rangeList[3];
+    
+    address=0x6000000000;
+    length=0x2000000;
+    addrSpace.s.space=kIOPCI64BitMemorySpace;
+    addrSpace.s.registerNum=0x10;
+    configurePCISpace("assigned-addresses", provider,addrSpace,address,length);
+    
+    rangeList[0] =
+    {
+        .start = address ,
+        .length = length,
+        .tag = addrSpace.bits
+    };
+    
+    address=0x50000000;
+    length=0x2000000;
+    addrSpace.s.space=kIOPCI32BitMemorySpace;
+    addrSpace.s.registerNum=0x18;
+    configurePCISpace("assigned-addresses", provider,addrSpace,address,length);
+    
+    rangeList[1] =
+    {
+        .start = address ,
+        .length = length,
+        .tag = addrSpace.bits
+    };
+    
+    address=0x6003100000;
+    length=0x100000;
+    // address=0x6003100000+0x2000;
+    // length=0x100000-0x2000;
+    addrSpace.s.space=kIOPCI64BitMemorySpace;
+    addrSpace.s.registerNum=0x20;
+    configurePCISpace("assigned-addresses", provider,addrSpace,address,length);
+    
+    rangeList[2] =
+    {
+        .start = address ,
+        .length = length,
+        .tag = addrSpace.bits
+    };
+    
+    OSArray *memoryArray = IODeviceMemory::arrayFromList(rangeList, 3);
+    if (memoryArray) {
+        //provider->setProperty("IODeviceMemory",memoryArray);
+        provider->setDeviceMemory(memoryArray);
+        memoryArray->release();
+    }
+
+    pciDevice->configWrite32(kIOPCIConfigBaseAddress0,  0);
+    pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03100000);
+}
+
 bool VMDDriver::vmdProbe(IOService *provider)
 {
     fPCIDev = OSDynamicCast(IOPCIDevice, provider);
@@ -701,6 +924,8 @@ bool VMDDriver::vmdProbe(IOService *provider)
         return false;
     }
 
+    configure1(provider);
+    
     fPCIDev->retain();
     fPCIDev->open(this);
     fPCIDev->setMemoryEnable(true);
@@ -1073,11 +1298,12 @@ void VMDDriver::postScanConfigure(void)
             IOPCIConfigEntry *child2 = VMDChildDevice::configEntryOf(nub2);
             if (!child2) continue;
 
+            resetDomain();
+        /*
             // pci_bus_save_and_disable()
             uint32_t savedState[64];
             for (int reg = 0; reg < 64; reg++)
                 savedState[reg] = nub2->configRead32(reg * 4);
-
             // pci_bridge_secondary_bus_reset()
             uint16_t bctl = nub->configRead16(PCI_BRIDGE_CONTROL);
             nub->configWrite16(PCI_BRIDGE_CONTROL,
@@ -1085,12 +1311,13 @@ void VMDDriver::postScanConfigure(void)
             IOSleep(2);
             nub->configWrite16(PCI_BRIDGE_CONTROL,
                                bctl & ~PCI_BRIDGE_CTL_BUS_RESET);
+
             IOSleep(100);
 
             // pci_bus_restore()
             for (int reg = 0; reg < 64; reg++)
                 nub2->configWrite32(reg * 4, savedState[reg]);
-
+*/
             if (nub2->configRead16(kIOPCIConfigCommand) == 0) continue;
 
             // Endpoints behind a VMD root port normally have no ACPI node
@@ -1105,7 +1332,7 @@ void VMDDriver::postScanConfigure(void)
 
             enableLTRQuirk(nub2);
             wireChildMSI(nub2);
-
+            
             IOLog("IntelVMD: endpoint %02x:%02x.%x configured\n",
                   child2->space.s.busNum, child2->space.s.deviceNum,
                   child2->space.s.functionNum);
