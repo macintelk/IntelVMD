@@ -120,15 +120,12 @@ enum vmd_features {
 
 class VMDChildDevice;
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * VMDDriver — one instance per VMD PCI function (Linux struct vmd_dev).
- *
- * Derives from IOPCI2PCIBridge so the whole IOPCIFamily enumeration,
- * resource-allocation and MSI machinery treats the VMD root complex like
- * a normal PCI host bridge.  All config cycles for buses behind the VMD
- * are routed to the VMD ECAM window (BAR0), exactly like Linux
- * vmd_pci_read()/vmd_pci_write().
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+struct VMDBarInfo {
+    uint64_t base;
+    uint64_t size;
+    bool     valid;
+};
+
 class VMDDriver : public IOPCI2PCIBridge
 {
     OSDeclareDefaultStructors(VMDDriver)
@@ -157,6 +154,8 @@ private:
         uint64_t start;
         uint64_t size;
     };
+    
+    
     VMDWindow               fWindows[3];
     uint32_t                fWindowCount;
 
@@ -165,6 +164,10 @@ private:
     IOWorkLoop *            fVmdWorkLoop;
     IOInterruptEventSource *fBridgeES;      /* reserves MSI-X vector 0     */
 
+    VMDBarInfo bars[3];
+    IOMemoryMap *           fMap1;
+    IOMemoryMap *           fMap2;
+    
     bool vmdProbe(IOService *provider);
     bool decodeAndPublishBars(void);
     bool getBusNumberStart(void);
@@ -224,6 +227,11 @@ public:
                            UInt64 address,
                            UInt64 length);
     
+    
+    void secondaryBusReset(IOPCIDevice *rootPort);
+    bool getLTRValue(IOPCIDevice *dev, uint32_t *value);
+    void setLTRValue(IOPCIDevice *dev, uint32_t value);
+    
 };
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -241,7 +249,8 @@ class VMDChildDevice : public IOPCIDevice
 
 public:
     VMDDriver * pvmd;
-
+    IOMemoryMap *rmmio {nullptr};
+    volatile UInt32 *rmmioPtr {nullptr};
     
     virtual UInt32 configRead32( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite32( IOPCIAddressSpace space,

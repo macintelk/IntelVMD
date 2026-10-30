@@ -114,117 +114,10 @@ static const VMDDeviceEntry * vmdLookupDevice(uint16_t deviceId)
 // physHi is an IOPCIAddressSpace: s.registerNum identifies the config
 // register (0x10/0x14/... for BARs), s.space the address space type.
 // --------------------------------------------------------------------------
-struct VMDBarInfo {
-    uint64_t base;
-    uint64_t size;
-    bool     valid;
-};
 
-static bool vmdParseBars(IORegistryEntry *provider, VMDBarInfo *bars)
-{
-    OSData *assigned = OSDynamicCast(OSData, provider->getProperty("assigned-addresses"));
-    if (!assigned) return false;
 
-    const uint32_t *reg = (const uint32_t *) assigned->getBytesNoCopy();
-    unsigned int    count = assigned->getLength() / (5 * sizeof(UInt32));
-    bool            any = false;
 
-    for (unsigned int i = 0; i < count; i++, reg += 5) {
-        IOPCIAddressSpace hi;
-        hi.bits = OSSwapLittleToHostInt32(reg[0]);
-        uint64_t base = ((uint64_t) OSSwapLittleToHostInt32(reg[1]) << 32)
-                      | OSSwapLittleToHostInt32(reg[2]);
-        uint64_t len  = ((uint64_t) OSSwapLittleToHostInt32(reg[3]) << 32)
-                      | OSSwapLittleToHostInt32(reg[4]);
 
-        if (hi.s.space == kIOPCIConfigSpace) continue;
-
-        uint32_t barIndex = (hi.s.registerNum - kIOPCIConfigBaseAddress0) / 4;
-        if (barIndex > 5) continue;
-
-        for (unsigned int b = 0; b < 3; b++) {
-            static const uint32_t vmdBarRegs[3] = {
-                VMD_CFGBAR * 4, VMD_MEMBAR1 * 4, VMD_MEMBAR2 * 4 };
-            if (hi.s.registerNum == kIOPCIConfigBaseAddress0 + vmdBarRegs[b]) {
-                bars[b].base  = base;
-                bars[b].size  = len;
-                bars[b].valid = (len != 0);
-                any |= bars[b].valid;
-            }
-        }
-    }
-    return any;
-}
-
-// Publish reg/assigned-addresses/IODeviceMemory for the VMD device from the
-// decoded windows (same properties Apple's stock enumeration would create).
-static void vmdPublishBars(IOService *provider, const VMDBarInfo *bars)
-{
-    IOPCIAddressSpace space = ((IOPCIDevice *)provider)->space;
-
-    OSData *regProp = OSData::withCapacity(64);
-    OSData *asgProp = OSData::withCapacity(64);
-    if (!regProp || !asgProp) {
-        if (regProp) regProp->release();
-        if (asgProp) asgProp->release();
-        return;
-    }
-
-    // config-space tuple first (like the stock "reg" property)
-    IOPCIAddressSpace cfg = space;
-    cfg.s.space = kIOPCIConfigSpace;
-    cfg.s.registerNum = 0;
-    uint32_t tuple[5] = { cfg.bits, 0, 0, 0, 0 };
-    regProp->appendBytes(tuple, sizeof(tuple));
-
-    IODeviceMemory::InitElement rangeList[3];
-    uint32_t                    nRanges = 0;
-
-    static const uint32_t vmdBarRegs[3] = {
-        VMD_CFGBAR * 4, VMD_MEMBAR1 * 4, VMD_MEMBAR2 * 4 };
-
-    for (uint32_t b = 0; b < 3; b++) {
-        if (!bars[b].valid) continue;
-
-        IOPCIAddressSpace as = space;
-        as.s.space       = (bars[b].base >> 32) ? kIOPCI64BitMemorySpace
-                                                : kIOPCI32BitMemorySpace;
-        as.s.registerNum = kIOPCIConfigBaseAddress0 + vmdBarRegs[b];
-        as.s.reloc       = 1;
-
-        uint32_t e[5] = {
-            as.bits,
-            (uint32_t)(bars[b].base >> 32),
-            (uint32_t)(bars[b].base),
-            (uint32_t)(bars[b].size >> 32),
-            (uint32_t)(bars[b].size) };
-        regProp->appendBytes(e, sizeof(e));
-        asgProp->appendBytes(e, sizeof(e));
-
-        rangeList[nRanges].start  = bars[b].base;
-        rangeList[nRanges].length = bars[b].size;
-        rangeList[nRanges].tag    = as.bits;
-        nRanges++;
-    }
-
-    provider->removeProperty("reg");
-    provider->removeProperty("assigned-addresses");
-    provider->removeProperty("IODeviceMemory");
-    provider->setProperty("reg", regProp);
-    if (asgProp->getLength()) provider->setProperty("assigned-addresses", asgProp);
-    regProp->release();
-    asgProp->release();
-
-    if (nRanges) {
-        OSArray *memoryArray = IODeviceMemory::arrayFromList(rangeList, nRanges);
-        if (memoryArray) {
-            provider->setDeviceMemory(memoryArray);
-            memoryArray->release();
-        }
-        provider->removeProperty("IOPCIResourced");
-        ((IOPCIDevice *)provider)->getResources();
-    }
-}
 
 // --------------------------------------------------------------------------
 // ecamOffset — Linux vmd_bus_to_ecam() + vmd_cfg_addr().
@@ -766,7 +659,6 @@ void VMDDriver::configurePCISpace(const char *propName, IOService *pciDevice,
 
 void VMDDriver::configure1( IOService * provider )
 {
-    //setProperty("domain-id", 0x10000,32);
     
     IOPCIDevice* pciDevice = OSDynamicCast(IOPCIDevice, provider);
     
@@ -796,14 +688,10 @@ void VMDDriver::configure1( IOService * provider )
     
     busEnd=0xFF;
     
-    
-    bool enable=true;
-    reg0=pciDevice->configRead16( PCI_REG_VMCONFIG);
-    reg0 = enable ? (reg0 & ~VMCONFIG_MSI_REMAP) :
-    (reg0 | VMCONFIG_MSI_REMAP);
-    pciDevice->configWrite16( PCI_REG_VMCONFIG, reg0);
-    
-    
+    pciDevice->configWrite32(kIOPCIConfigBaseAddress0,  0);
+    pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03100000);
+    //pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03102000);
+
     IOPCIAddressSpace space;
     space.s.busNum = busStart;
     
@@ -870,6 +758,10 @@ void VMDDriver::configure1( IOService * provider )
     addrSpace.s.registerNum=0x10;
     configurePCISpace("assigned-addresses", provider,addrSpace,address,length);
     
+    bars[0].base  = address;
+    bars[0].size  = length;
+    bars[0].valid = true;
+    
     rangeList[0] =
     {
         .start = address ,
@@ -883,6 +775,10 @@ void VMDDriver::configure1( IOService * provider )
     addrSpace.s.registerNum=0x18;
     configurePCISpace("assigned-addresses", provider,addrSpace,address,length);
     
+    bars[1].base  = address;
+    bars[1].size  = length;
+    bars[1].valid = true;
+    
     rangeList[1] =
     {
         .start = address ,
@@ -892,11 +788,15 @@ void VMDDriver::configure1( IOService * provider )
     
     address=0x6003100000;
     length=0x100000;
-    // address=0x6003100000+0x2000;
-    // length=0x100000-0x2000;
+     //address=0x6003100000+0x2000;
+     //length=0x100000-0x2000;
     addrSpace.s.space=kIOPCI64BitMemorySpace;
     addrSpace.s.registerNum=0x20;
     configurePCISpace("assigned-addresses", provider,addrSpace,address,length);
+    
+    bars[2].base  = address;
+    bars[2].size  = length;
+    bars[2].valid = true;
     
     rangeList[2] =
     {
@@ -912,8 +812,9 @@ void VMDDriver::configure1( IOService * provider )
         memoryArray->release();
     }
 
-    pciDevice->configWrite32(kIOPCIConfigBaseAddress0,  0);
-    pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03100000);
+    //pciDevice->removeProperty("IOPCIResourced");
+    //pciDevice->getResources();
+    
 }
 
 bool VMDDriver::vmdProbe(IOService *provider)
@@ -1014,20 +915,11 @@ bool VMDDriver::vmdProbe(IOService *provider)
     return true;
 }
 
-/* decode + publish + map the VMD device's own BARs (CFGBAR/MEMBAR1/MEMBAR2).
- * Sizes and bases come from the BIOS-assigned "assigned-addresses" property
- * of the provider nub — no hardcoded addresses. */
+
 bool VMDDriver::decodeAndPublishBars(void)
 {
-    VMDBarInfo bars[3] = {};
-    if (!vmdParseBars(fPCIDev, bars)) {
-        IOLog("IntelVMD: provider has no assigned-addresses; "
-              "cannot decode VMD windows\n");
-        return false;
-    }
-    fCfgBarSize = bars[0].size;
 
-    vmdPublishBars(fPCIDev, bars);
+    fCfgBarSize = bars[0].size;
 
     fWindowCount = 0;
     if (bars[1].valid)
@@ -1043,7 +935,12 @@ bool VMDDriver::decodeAndPublishBars(void)
           (unsigned long long)bars[1].base, (unsigned long long)bars[1].size,
           (unsigned long long)bars[2].base, (unsigned long long)bars[2].size);
 
+    
     fCfgMap = fPCIDev->mapDeviceMemoryWithIndex(0);
+    
+    //fMap1= fPCIDev->mapDeviceMemoryWithIndex(2);
+    //fMap2= fPCIDev->mapDeviceMemoryWithIndex(4);
+    
     if (!fCfgMap) {
         IOLog("IntelVMD: cannot map CFGBAR\n");
         return false;
@@ -1084,19 +981,25 @@ bool VMDDriver::start(IOService *provider)
         IOLog("IntelVMD: IOPCI2PCIBridge::start failed\n");
         return false;
     }
+    
 
+    fPCIDev->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
     fPCIDev->setPowerState(kIOPCIDeviceOnState, this);
-
+    IOSleep(10);
+    
+    
     // pci_scan_child_bus()
     configOpParams cp;
     cp.device = fPCIDev;
     cp.op     = kConfigOpScan;
     cp.result = NULL;
     configOp(&cp);
-
+    
+    
     postScanConfigure();
 
     registerService();
+
     
     return true;
 }
@@ -1224,7 +1127,7 @@ bool VMDDriver::seedBridgeEntry(void)
     }
 
     // Intel VMD _DSM function 5 (VD3A) — keep D3 power management enabled.
-    if (selfAcpi) {
+   /* if (selfAcpi) {
         static const uint8_t uuidBytes[16] = {
             0xdd, 0xcd, 0xd9, 0x9c, 0x45, 0x88, 0xfd, 0x4a,
             0x83, 0x92, 0x31, 0xc4, 0xeb, 0x87, 0xca, 0xbd };
@@ -1246,7 +1149,7 @@ bool VMDDriver::seedBridgeEntry(void)
         if (uuid) uuid->release();
     } else {
         IOLog("IntelVMD: no ACPI node for the VMD device; skipping _DSM\n");
-    }
+    }*/
 
     // Save the VMD device's config registers into the IOPCIFamily shadow
     // (used by saveDeviceState/restoreDeviceState across sleep).
@@ -1257,20 +1160,15 @@ bool VMDDriver::seedBridgeEntry(void)
     return true;
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * postScanConfigure — per-device work after pci_scan_child_bus():
- *
- *   1. vmd_acpi_find_companion() for every device behind the VMD, so
- *      Apple's IONVMeFamily finds acpiRootDevice (the "big issue").
- *   2. vmd_pm_enable_quirk() — driver-default LTR values.
- *   3. child MSI wiring onto the VMD's own MSI-X vectors (irq demux).
- *   4. hot reset of each root port before touching its endpoints
- *      (Linux: pci_reset_bus() on the first child, propagated down).
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::postScanConfigure(void)
 {
     if (!fBridgeEntry) return;
 
+    resetDomain();
+    IOSleep(100);
+    
+    
     for (IOPCIConfigEntry *child = fBridgeEntry->child; child; child = child->peer) {
         IOPCIDevice *nub = OSDynamicCast(IOPCIDevice, child->dtNub);
         if (!nub) continue;
@@ -1283,64 +1181,153 @@ void VMDDriver::postScanConfigure(void)
         enableLTRQuirk(nub);
 
         wireChildMSI(nub);
-
+        
+        
         if (child->isBridge) {
-            // pci_reset_bus() analogue — Linux: pci_bus_save_and_disable(),
-            // pci_bridge_secondary_bus_reset(), pci_bus_restore().  The
-            // two-argument IOPCIDevice::reset() overload is not exported by
-            // IOPCIFamily (kmutil cannot bind it on macOS 13), so the reset
-            // bit is asserted in the root port's bridge control register by
-            // hand, with the endpoint's config space saved and restored
-            // around it (a bus reset zeroes BARs and the command register).
+            
+
             IOPCIDevice *nub2 =
                 OSDynamicCast(IOPCIDevice, nub->getChildEntry(gIODTPlane));
             if (!nub2) continue;
             IOPCIConfigEntry *child2 = VMDChildDevice::configEntryOf(nub2);
             if (!child2) continue;
 
-            resetDomain();
-            IOSleep(100);
             
-        /*
-            // pci_bus_save_and_disable()
-            uint32_t savedState[64];
-            for (int reg = 0; reg < 64; reg++)
-                savedState[reg] = nub2->configRead32(reg * 4);
-            // pci_bridge_secondary_bus_reset()
-            uint16_t bctl = nub->configRead16(PCI_BRIDGE_CONTROL);
-            nub->configWrite16(PCI_BRIDGE_CONTROL,
-                               bctl | PCI_BRIDGE_CTL_BUS_RESET);
-            IOSleep(2);
-            nub->configWrite16(PCI_BRIDGE_CONTROL,
-                               bctl & ~PCI_BRIDGE_CTL_BUS_RESET);
-
-            IOSleep(100);
-
-            // pci_bus_restore()
-            for (int reg = 0; reg < 64; reg++)
-                nub2->configWrite32(reg * 4, savedState[reg]);
-*/
+            secondaryBusReset(nub);
                 
             if (nub2->configRead16(kIOPCIConfigCommand) == 0) continue;
 
-            // Endpoints behind a VMD root port normally have no ACPI node
-            // of their own (BIOS only declares the root ports).  Apple's
-            // IONVMeController attaches to the endpoint nub and its
-            // InitializeController() asserts "( 0 != acpiRootDevice )" via
-            // CopyACPIParent() when the ssd-off-in-S4 flag is set — make
-            // the endpoint nub inherit the root port's association so the
-            // copyProperty("acpi-path", IterateRecursively|IterateParents)
-            // lookup always resolves.
+
             associateACPI(child2, nub);
 
             enableLTRQuirk(nub2);
             wireChildMSI(nub2);
             
+
             IOLog("IntelVMD: endpoint %02x:%02x.%x configured\n",
                   child2->space.s.busNum, child2->space.s.deviceNum,
                   child2->space.s.functionNum);
         }
     }
+
+}
+
+
+
+
+static constexpr uint32_t kMaxEndpointsPerPort = 8;
+
+void VMDDriver::secondaryBusReset(IOPCIDevice *rootPort)
+{
+    int32_t disabled = 0;
+
+    IOPCIConfigEntry *rpEntry = VMDChildDevice::configEntryOf(rootPort);
+    if (!rpEntry) {
+
+        return;
+    }
+
+
+    IOPCIConfigEntry *kids[kMaxEndpointsPerPort] = {};
+    uint32_t nKids = 0;
+    for (IOPCIConfigEntry *c = rpEntry->child;
+         c && nKids < kMaxEndpointsPerPort; c = c->peer)
+        if (c->dtNub) kids[nKids++] = c;
+    if (!nKids) {
+
+        return;
+    }
+
+    uint32_t saved[kMaxEndpointsPerPort][64] = {};
+    bool     epAlive[kMaxEndpointsPerPort] = {};
+    uint32_t nAlive = 0;
+
+    for (uint32_t i = 0; i < nKids; i++) {
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, kids[i]->dtNub);
+        if (!d) continue;
+        for (uint32_t r = 0; r < 64; r++)
+            saved[i][r] = d->configRead32(r * 4);
+        if (saved[i][0] != 0xFFFFFFFF) { epAlive[i] = true; nAlive++; }
+    }
+    if (!nAlive) {
+
+        return;
+    }
+
+    uint32_t rpLTR = 0, epLTR[kMaxEndpointsPerPort] = {};
+    bool haveRP = getLTRValue(rootPort, &rpLTR);
+    bool haveEP[kMaxEndpointsPerPort] = {};
+    for (uint32_t i = 0; i < nKids; i++) {
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, kids[i]->dtNub);
+        if (d && epAlive[i]) haveEP[i] = getLTRValue(d, &epLTR[i]);
+    }
+
+
+    uint16_t bctl = rootPort->configRead16(PCI_BRIDGE_CONTROL);
+    rootPort->configWrite16(PCI_BRIDGE_CONTROL, bctl | PCI_BRIDGE_CTL_BUS_RESET);
+    IOSleep(10);
+    rootPort->configWrite16(PCI_BRIDGE_CONTROL, bctl & ~PCI_BRIDGE_CTL_BUS_RESET);
+    IOSleep(100);
+
+    bool cameBack = false;
+    for (int tries = 0; tries < 100 && !cameBack; tries++) {
+        for (uint32_t i = 0; i < nKids && !cameBack; i++) {
+            if (!epAlive[i]) continue;
+            IOPCIDevice *d = OSDynamicCast(IOPCIDevice, kids[i]->dtNub);
+            cameBack = d && d->configRead16(kIOPCIConfigVendorID) != 0xFFFF;
+        }
+        if (!cameBack) IOSleep(10);
+    }
+
+
+    for (uint32_t i = 0; i < nKids; i++) {
+        if (!epAlive[i]) continue;
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, kids[i]->dtNub);
+        if (!d) continue;
+        for (uint32_t r = 2; r < 64; r++)
+            d->configWrite32(r * 4, saved[i][r]);
+        d->configWrite32(kIOPCIConfigCommand, saved[i][1]);
+        if (haveEP[i]) setLTRValue(d, epLTR[i]);
+    }
+    if (haveRP) setLTRValue(rootPort, rpLTR);
+
+
+    enableLTRQuirk(rootPort);
+    for (uint32_t i = 0; i < nKids; i++) {
+        if (!epAlive[i]) continue;
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, kids[i]->dtNub);
+        if (d) enableLTRQuirk(d);
+    }
+
+
+}
+bool VMDDriver::getLTRValue(IOPCIDevice *dev, uint32_t *value)
+{
+    if (!dev || !value) return false;
+
+    IOPCIAddressSpace space = dev->space;
+    IOByteCount pos = 0;
+    if (!extendedFindPCICapability(space, -PCI_EXT_CAP_ID_LTR, &pos) || !pos)
+        return false;
+
+    IOPCIAddressSpace es = space;
+    es.bits &= ~0x0F000000;
+    es.es.registerNumExtended = ((uint32_t)pos >> 8) & 0xF;
+    *value = configRead32(es, (UInt8)(pos & 0xFF));
+    return true;
+}
+
+void VMDDriver::setLTRValue(IOPCIDevice *dev, uint32_t value)
+{
+    IOPCIAddressSpace space = dev->space;
+    IOByteCount pos = 0;
+    if (!extendedFindPCICapability(space, -PCI_EXT_CAP_ID_LTR, &pos) || !pos)
+        return ;
+
+    IOPCIAddressSpace es = space;
+    es.bits &= ~0x0F000000;
+    es.es.registerNumExtended = ((uint32_t)pos >> 8) & 0xF;
+    configWrite32(es, (UInt8)(pos & 0xFF), value);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
