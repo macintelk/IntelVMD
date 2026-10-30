@@ -113,10 +113,69 @@ enum vmd_features {
 #define PCI_BRIDGE_CONTROL      0x3e    /* bridge control (secondary bus reset) */
 #define PCI_BRIDGE_CTL_BUS_RESET 0x40   /* PCI_BRIDGE_CTL_BUS_RESET */
 
+/* Command / secondary-status / link bits used by the bridge check.
+ * (pci_regs.h names; the IOPCI headers do not export them.) */
+#define PCI_COMMAND_MEMORY      0x0002  /* command.MEM space enable       */
+#define PCI_COMMAND_MASTER      0x0004  /* command.bus master             */
+#define PCI_SEC_STATUS          0x1e    /* bridge secondary status        */
+#define PCI_SEC_STATUS_RMA      0x1000  /* received master abort          */
+#define PCI_SEC_STATUS_RTA      0x2000  /* received target abort          */
+#define PCI_EXP_LNKCTL_RETRAIN  0x0020  /* LNKCTL.Retrain Link            */
+#define PCI_EXP_LNKSTA_DLLLA    0x2000  /* LNKSTA.DLL Link Active         */
+#define PCI_EXP_LNKSTA_TRAINING 0x0800  /* LNKSTA.Link Training           */
+
 /* IONVMeFamily integration keys (see VMD.cpp associateACPI). */
 #ifndef kACPIDevicePathKey
 #define kACPIDevicePathKey      "acpi-path"
 #endif
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * Apple IONVMeFamily init-probe constants (ported from IONVMeFamilyTA.c).
+ *
+ * IONVMeController::InitializePCI() maps BAR0 and SetNVMeProperties()
+ * reads CAP (ReadRegister64(0)) and VS (ReadRegister32(8)).  The four
+ * IONVMeDebugAssert guards below are where Apple's driver dies when the
+ * controller registers are not readable behind the VMD ("fails at cap
+ * reading"); VMDDriver::appleNVMeInitDebug() reproduces the same checks
+ * and publishes the results as registry properties on the endpoint nub.
+ *
+ *   "( CAP != kNVMeInvalidRegisterValue64 )"            IONVMeController.cpp:0x4d8
+ *       BAR0+0x00 read all-ones — the MMIO transaction never reached the
+ *       controller (BAR0 unassigned/zeroed after the hot reset, MEM decode
+ *       off, device in D3, or VMD MEMBAR2 routing broken).
+ *   "( CAP & kNVMe_CAP_CommandSetSupported_NVM_Mask )"  :0x4dd
+ *       CAP.CSS.NVM (bit 37) clear — controller answered but does not
+ *       advertise the NVM command set.
+ *   "( ( CAP & kNVMe_CAP_MPS_Min_Mask ) == 0 )"         :0x4e0
+ *       CAP.MPSMIN (bits 48-51) non-zero — Apple only supports a 4 KB
+ *       minimum memory page size.
+ *   "( fVersion != kNVMeInvalidRegisterValue32 )"       :0x501
+ *       VS (BAR0+0x08) read all-ones.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* NVMe controller registers (offsets within BAR0). */
+#define NVME_REG_CAP                    0x00
+#define NVME_REG_VS                     0x08
+#define NVME_REG_CC                     0x14
+#define NVME_REG_CSTS                   0x1C
+
+/* IONVMeFamily invalid-register sentinels. */
+#define kNVMeInvalidRegisterValue64     0xFFFFFFFFFFFFFFFFULL
+#define kNVMeInvalidRegisterValue32     0xFFFFFFFFU
+
+/* CAP field masks (IONVMeController.cpp SetNVMeProperties()). */
+#define kNVMe_CAP_MQES_Mask             0x000000000000FFFFULL   /* max queue entries - 1  */
+#define kNVMe_CAP_CQR_Mask              0x0000000000010000ULL   /* contiguous queues req. */
+#define kNVMe_CAP_AMS_Mask              0x0000000000060000ULL   /* arbitration mechanisms */
+#define kNVMe_CAP_TO_Mask               0x00000000FF000000ULL   /* timeout, 500 ms units  */
+#define kNVMe_CAP_DSTRD_Mask            0x00000000F0000000ULL   /* doorbell stride        */
+#define kNVMe_CAP_NSSR_Mask             0x0000000100000000ULL   /* subsystem reset        */
+#define kNVMe_CAP_CommandSetSupported_NVM_Mask  0x0000002000000000ULL   /* CSS.NVM, bit 37   */
+#define kNVMe_CAP_MPS_Min_Mask          0x000F000000000000ULL   /* bits 48-51, must be 0  */
+#define kNVMe_CAP_MPS_Max_Mask          0x00F0000000000000ULL   /* bits 52-55             */
+
+/* CSTS bits sampled by the debug probe. */
+#define kNVMe_CSTS_RDY_Mask             0x00000001
 
 class VMDChildDevice;
 
@@ -177,6 +236,9 @@ private:
     bool setupMSIX(void);
     bool seedBridgeEntry(void);
     void postScanConfigure(void);
+    void appleNVMeInitDebug(IOPCIDevice *nub2);
+    void vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2);
+    bool stabilizeNVMeForCAP(IOPCIDevice *rp, IOPCIDevice *nub2);
     void associateACPI(IOPCIConfigEntry *entry, IOPCIDevice *inheritFrom);
     void wireChildMSI(IOPCIDevice *nub);
     void enableLTRQuirk(IOPCIDevice *dev);
@@ -227,10 +289,7 @@ public:
                            UInt64 address,
                            UInt64 length);
     
-    
-    void secondaryBusReset(IOPCIDevice *rootPort);
-    bool getLTRValue(IOPCIDevice *dev, uint32_t *value);
-    void setLTRValue(IOPCIDevice *dev, uint32_t value);
+    VMDChildDevice *nvme;
     
 };
 
@@ -264,6 +323,21 @@ public:
     
     virtual IOWorkLoop * getWorkLoop(void) const override;
     virtual void free(void) override;
+
+    /* Decode-chain re-assert hooks.  Boot-3 evidence (pci1344,5411): the
+     * postScanConfigure() probe read a valid CAP (VMD-Dbg-APL-InitOK true),
+     * yet Apple still panicked on the same CAP read -- and RMA was recorded
+     * again although vmdBridgeCheck() had cleared it.  Prime clobberer found
+     * in IOPCIFamily 726: IOPCI2PCIBridge::checkLink() zeroes the root-port
+     * memory windows (kPCI2PCIMemoryRange/Prefetch, IOPCIBridge.cpp:4905)
+     * whenever LNKSTA.DLLLA reads 0 during a power/link transition, and
+     * nothing ever restores them.  These hooks re-assert the decode chain at
+     * nub start and at the exact call Apple's InitializePCI() uses to map
+     * BAR0 -- the last controllable point before the first MMIO read. */
+    virtual bool start(IOService *provider) override;
+    virtual IOMemoryMap * mapDeviceMemoryWithRegister(
+                            UInt8 reg, IOOptionBits options = 0) override;
+    void reassertDecodeChain(const char *why);
 
     /* Access to IOPCIDevice-protected state (configEntry / msiVectors).
      * Defined as static members of VMDChildDevice because protected-member
