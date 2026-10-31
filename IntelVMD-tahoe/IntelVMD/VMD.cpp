@@ -886,10 +886,7 @@ bool VMDDriver::vmdProbe(IOService *provider)
     // the Linux feature table; force per-boot with an OSBoolean/OSData
     // property on the VMD device: "VMD-Force-Bypass" / "VMD-Force-Demux".
     fDemuxMode = !(fFeatures & VMD_FEAT_CAN_BYPASS_MSI_REMAP);
-   // if (vmdBoolProperty(fPCIDev, "VMD-Force-Demux", false))
-        fDemuxMode = true;
-   // if (vmdBoolProperty(fPCIDev, "VMD-Force-Bypass", false))
-        //fDemuxMode = false;
+
     fPCIDev->setProperty("VMD-MSI-Model", fDemuxMode ? "demux" : "bypass");
 
     if (fDemuxMode) {
@@ -950,8 +947,8 @@ bool VMDDriver::decodeAndPublishBars(void)
     
     fCfgMap = fPCIDev->mapDeviceMemoryWithIndex(0);
     
-    //fMap1= fPCIDev->mapDeviceMemoryWithIndex(2);
-    //fMap2= fPCIDev->mapDeviceMemoryWithIndex(4);
+    fMap1= fPCIDev->mapDeviceMemoryWithIndex(2);
+    fMap2= fPCIDev->mapDeviceMemoryWithIndex(4);
     
     if (!fCfgMap) {
         IOLog("IntelVMD: cannot map CFGBAR\n");
@@ -960,23 +957,7 @@ bool VMDDriver::decodeAndPublishBars(void)
     return true;
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * VMDDriver::start — entry point (Linux vmd_probe() + vmd_enable_domain()).
- *
- * macOS glue order:
- *   1. vmdProbe()            — hardware bring-up (Linux probe)
- *   2. seedBridgeEntry()     — describe the root complex to IOPCIFamily
- *   3. IOPCI2PCIBridge::start() — stock Apple bridge start; creates the
- *                              messaged-interrupt controller (the VMD
- *                              irq_domain equivalent). This kext does NOT
- *                              override IOPCI2PCIBridge::start, so the
- *                              qualified call binds to the real IOPCIFamily
- *                              implementation.
- *   4. kConfigOpScan         — pci_scan_child_bus(): enumerates the VMD
- *                              buses through our ECAM config accessors and
- *                              builds VMDChildDevice nubs via createNub().
- *   5. postScanConfigure()   — ACPI association + LTR quirk + MSI wiring.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 bool VMDDriver::start(IOService *provider)
 {
     pvmd=this;
@@ -991,17 +972,16 @@ bool VMDDriver::start(IOService *provider)
     }
     fPCIDev->setProperty("VMD-Stage-Seed", true);
 
+    fPCIDev->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
+    fPCIDev->setPowerState(kIOPCIDeviceOnState, this);
+    IOSleep(10);
+    
     bool ok = IOPCI2PCIBridge::start(provider);
     if (!ok) {
         IOLog("IntelVMD: IOPCI2PCIBridge::start failed\n");
         return false;
     }
     fPCIDev->setProperty("VMD-Stage-FamilyStart", true);
-
-    fPCIDev->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
-    fPCIDev->setPowerState(kIOPCIDeviceOnState, this);
-    IOSleep(10);
-    
     
     // pci_scan_child_bus()
     configOpParams cp;
@@ -1269,9 +1249,6 @@ static uint32_t vmdMaxBars(IOPCIDevice *nub)
     return 0;
 }
 
-/* vmdAddDeviceBars — fold one device's live memory BARs into the window
- * spans.  Config space wins over the scan descriptors (same rule as
- * reassertDecodeChain); sizes come from the descriptors when available. */
 static void vmdAddDeviceBars(IOPCIDevice *nub, IOPCIConfigEntry *entry,
                              uint64_t *memMin, uint64_t *memMax, bool *haveMem,
                              uint64_t *pfMin, uint64_t *pfMax, bool *havePF)
@@ -1644,6 +1621,9 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
         return;
     }
 
+    nub->retain();
+    //nub->open(this);
+    
     // 1. ACPI companion (vmd_acpi_find_companion)
     associateACPI(entry, parentNub);
 
@@ -1667,8 +1647,7 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
 
     // 7. endpoint behind a root port: link prep; NVMe: + controller probe
     if (!isBridge && parentNub) {
-        uint32_t cls = nub->configRead32(kIOPCIConfigRevisionID) >> 16;
-        endpointLinkPrep(parentNub, nub, cls == VMD_CLASS_NVME);
+        endpointLinkPrep(parentNub, nub);
     }
 
     // 8. recurse — every child of this bridge gets the same treatment
@@ -1677,8 +1656,7 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
 }
 
 
-void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2,
-                                 bool isNVMe)
+void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!rp || !nub2) return;
 
@@ -1728,22 +1706,8 @@ void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2,
         IODelay(10000);
     }
 
-    // Decode chain check + fix (registry properties on nub2).  Idempotent:
-    // the generic steps above already opened the windows this re-verifies.
     vmdBridgeCheck(rp, nub2);
 
-    if (!isNVMe) return;
-
-    // CAP stability loop — after a reset some drives (Micron 2450 among
-    // them) answer config space but stay silent on MMIO for a while; poll
-    // CAP (read-only) until the controller answers instead of letting
-    // Apple's SetNVMeProperties() hit the all-ones assert.
-    stabilizeNVMeForCAP(rp, nub2);
-
-    // Apple IONVMeFamily init probe — registry properties on nub2, no
-    // IOLog.  Runs after D0 / ASPM-off / link-up so the MMIO reads see the
-    // same state IONVMeController::InitializePCI() will see when
-    // IONVMeFamily matches below.
     appleNVMeInitDebug(nub2);
 }
 
@@ -1783,46 +1747,6 @@ static inline uint64_t vmdReadCAP(volatile UInt8 *mmio)
          | ((uint64_t)OSReadLittleInt32(mmio, NVME_REG_CAP + 4) << 32);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * vmdBridgeCheck — VMD-device -> root-port -> endpoint decode chain.
- * Registry-only debug: every value lands on nub2 as a "VMD-Dbg-RP-*" /
- * "VMD-Dbg-DEV-*" property; no IOLog.
- *
- * Why: postScanConfigure() runs resetDomain() AFTER the configurator scan,
- * and resetDomain() closes every bridge window behind the VMD.  The
- * endpoint keeps its BAR assignment (so mapDeviceMemoryWithRegister() works
- * and "the mmio bar is fine"), but the root port forwards no memory TLPs
- * downstream, and the first controller read — IONVMeFamilyTA.c
- * SetNVMeProperties()'s CAP = ReadRegister64(0) — master-aborts to
- * 0xFFFFFFFFFFFFFFFF (the "( CAP != kNVMeInvalidRegisterValue64 )" assert,
- * observed on pci1344,5411 Micron 2450).
- *
- * Fixes applied from config space alone:
- *   - VMD device + root port + endpoint command.MEM (and bus master) set
- *     when clear,
- *   - root-port memory window reprogrammed over the endpoint's non-PF BARs
- *     when closed or not covering them,
- *   - prefetchable window likewise when the endpoint has PF BARs.
- *
- * Published (nub2):
- *   VMD-Dbg-VMD-CMD        VMD device command register
- *   VMD-Dbg-RP-CMD         root-port command register
- *   VMD-Dbg-RP-MEM-Fixed   RP command.MEM/BM was off and was set
- *   VMD-Dbg-RP-MEM-REG     raw 32-bit @0x20 (mem base|limit registers)
- *   VMD-Dbg-RP-MEM-BASE/LIMIT   decoded window (host addresses)
- *   VMD-Dbg-RP-MEM-Win-OK  endpoint non-PF BARs inside the window
- *   VMD-Dbg-RP-MEM-Win-Fixed    window was reprogrammed
- *   VMD-Dbg-RP-PF-*        same for the prefetchable window (@0x24)
- *   VMD-Dbg-RP-SECSTS      bridge secondary status
- *   VMD-Dbg-RP-Abort-History    RMA/RTA seen (confirms earlier master aborts)
- *   VMD-Dbg-RP-LSTS / VMD-Dbg-RP-DLLLA   root-port link status
- *   VMD-Dbg-EP-LSTS        endpoint link status
- *   VMD-Dbg-DEV-VID/DID    endpoint identity (ECAM sanity)
- *   VMD-Dbg-DEV-CMD        endpoint command register
- *   VMD-Dbg-DEV-MEM-Fixed  endpoint command.MEM was off and was set
- *   VMD-Dbg-BAR0-CFG       raw 64-bit BAR0 value from config space
- *   VMD-Dbg-RP-Cfg-Dead    ECAM reads all-ones for the endpoint itself
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void VMDDriver::vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!rp || !nub2) return;
@@ -1838,10 +1762,7 @@ void VMDDriver::vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2)
         return;
     }
 
-    // ---- collect the endpoint's memory BARs -------------------------------
-    // Same "reg"-property parsing as seedBridgeEntry(): each device-memory
-    // entry carries its BAR number in the address-space tag; prefetch-
-    // ability comes from the BAR register itself (bit 3).
+
     uint64_t memMin = ~0ULL, memMax = 0, pfMin = ~0ULL, pfMax = 0;
     uint64_t bar0Cfg = 0;
     bool haveMem = false, havePF = false;
@@ -1979,125 +1900,6 @@ void VMDDriver::vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2)
     }
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * stabilizeNVMeForCAP — poll until the controller answers MMIO (CAP).
- * Registry-only debug; no IOLog.
- *
- * Even with the decode chain fixed, a drive that just came out of a
- * secondary-bus reset can answer config space while its controller
- * registers stay silent on MMIO for a while (pci1344,5411 Micron 2450
- * firmware needs the settle time); an early read returns all-ones — the
- * exact value Apple's SetNVMeProperties() asserts on.  This loop samples
- * CAP (BAR0+0x00) — READ-ONLY, CC/CSTS stay pristine for Apple's
- * DetermineBootState() — until it is neither all-ones nor zero, for up to
- * 3 seconds, applying two config-space-only kicks while waiting:
- *
- *   - every 5th poll: toggle the endpoint's command.MEM — some devices
- *     (re-)arm their decode logic only on a command-register write,
- *   - at poll 10, if the link is still down: root-port LNKCTL.Retrain Link.
- *
- * Published (nub2):
- *   VMD-Dbg-CAP-Pre     first CAP read (pre-loop)
- *   VMD-Dbg-CAP-Last    last CAP read
- *   VMD-Dbg-CAP-Polls   polls consumed (1..60)
- *   VMD-Dbg-CAP-Stable  controller answered MMIO
- *   VMD-Dbg-CAP-NoMap   BAR0 could not be mapped at all
- *   VMD-Dbg-Kick-Decode / VMD-Dbg-Kick-Retrain   kicks applied
- *
- * The BAR0 mapping is stashed on the nub (VMDChildDevice::rmmio) and
- * reused by appleNVMeInitDebug().
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-bool VMDDriver::stabilizeNVMeForCAP(IOPCIDevice *rp, IOPCIDevice *nub2)
-{
-    if (!nub2) return false;
-
-    const uint32_t kMaxPolls  = 60;    // 60 * 50 ms = 3 s worst case
-    const uint32_t kPollGapMS = 50;
-
-    VMDChildDevice *child = OSDynamicCast(VMDChildDevice, nub2);
-    IOMemoryMap *bar0 = (child && child->rmmio) ? child->rmmio : NULL;
-    bool stashed = (bar0 != NULL);
-    if (!bar0) {
-        bar0 = nub2->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
-                                                 kIOMapInhibitCache
-                                                 | kIOMapAnywhere);
-        if (!bar0) {
-            nub2->setProperty("VMD-Dbg-CAP-Stable", false);
-            nub2->setProperty("VMD-Dbg-CAP-NoMap", true);
-            return false;
-        }
-    }
-
-    volatile UInt8 *mmio = (volatile UInt8 *)bar0->getVirtualAddress();
-    if (!mmio || bar0->getLength() < NVME_REG_CSTS + 4) {
-        nub2->setProperty("VMD-Dbg-CAP-Stable", false);
-        if (!stashed) bar0->release();
-        return false;
-    }
-
-    // keep the mapping for appleNVMeInitDebug() / follow-up debugging
-    if (child && !child->rmmio) {
-        child->rmmio    = bar0;
-        child->rmmioPtr = (volatile UInt32 *)mmio;
-        stashed = true;
-    }
-
-    UInt8 epPcie = 0;
-    bool haveEPCap = nub2->findPCICapability(kIOPCIPCIExpressCapability,
-                                             &epPcie) && epPcie;
-
-    uint64_t cap    = vmdReadCAP(mmio);
-    uint64_t capPre = cap;
-    nub2->setProperty("VMD-Dbg-CAP-Pre", (unsigned long long)capPre, 64);
-
-    bool stable = (cap != kNVMeInvalidRegisterValue64) && (cap != 0);
-    bool kickDecode = false, kickRetrain = false;
-    uint32_t polls = 1;
-
-    while (!stable && polls < kMaxPolls) {
-        IOSleep(kPollGapMS);
-
-        if ((polls % 5) == 0) {
-            // kick 1 — re-arm the endpoint's memory decode
-            UInt16 cmd = nub2->configRead16(kIOPCIConfigCommand);
-            nub2->configWrite16(kIOPCIConfigCommand,
-                                cmd & ~PCI_COMMAND_MEMORY);
-            IOSleep(2);
-            nub2->configWrite16(kIOPCIConfigCommand, cmd);
-            kickDecode = true;
-        }
-        if (polls == 10 && rp && haveEPCap) {
-            // kick 2 — root-port link retrain if the link is still down
-            UInt16 lsts = nub2->configRead16(epPcie + 0x12);
-            if ((lsts & PCI_EXP_LNKSTA_DLLLA) == 0) {
-                UInt8 rpPcie = 0;
-                if (rp->findPCICapability(kIOPCIPCIExpressCapability,
-                                          &rpPcie) && rpPcie) {
-                    UInt16 lctl = rp->configRead16(rpPcie + 0x10);
-                    rp->configWrite16(rpPcie + 0x10,
-                                      lctl | PCI_EXP_LNKCTL_RETRAIN);
-                    kickRetrain = true;
-                }
-            }
-        }
-
-        cap = vmdReadCAP(mmio);
-        polls++;
-        stable = (cap != kNVMeInvalidRegisterValue64) && (cap != 0);
-    }
-
-    nub2->setProperty("VMD-Dbg-CAP-Stable", stable);
-    nub2->setProperty("VMD-Dbg-CAP-Polls", polls, 32);
-    nub2->setProperty("VMD-Dbg-CAP-Last", (unsigned long long)cap, 64);
-    nub2->setProperty("VMD-Dbg-Kick-Decode", kickDecode);
-    nub2->setProperty("VMD-Dbg-Kick-Retrain", kickRetrain);
-
-    // Not stashed on a nub (defensive: nub2 was not a VMDChildDevice) and
-    // the mapping was created here — nothing else owns it, release it.
-    if (!stashed) bar0->release();
-
-    return stable;
-}
 
 
 void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
@@ -2138,96 +1940,87 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
 
     volatile UInt8 *mmio = (volatile UInt8 *)bar0->getVirtualAddress();
     if (!mmio) {
-        nub2->setProperty("VMD-Dbg-BAR0-Valid", false);
-        nub2->setProperty("VMD-Dbg-APL-InitOK", false);
-        bar0->release();
         return;
     }
 
-    // Registers up to CSTS (0x1C) must be inside the mapping; NVMe BAR0 is
-    // 16 KB per spec — anything smaller means the BAR assignment is broken.
-    if (bar0->getLength() < NVME_REG_CSTS + 4) {
-        nub2->setProperty("VMD-Dbg-BAR0-Valid", false);
-        nub2->setProperty("VMD-Dbg-BAR0-TooSmall", true);
-        nub2->setProperty("VMD-Dbg-APL-InitOK", false);
-        bar0->release();
-        return;
-    }
-    nub2->setProperty("VMD-Dbg-BAR0-Valid", true);
 
-    // Keep the mapping on the nub for follow-up debugging (rmmio/rmmioPtr
-    // exist for exactly this purpose; see the commented block above).
     if (child && !child->rmmio) {
         child->rmmio    = bar0;
         child->rmmioPtr = (volatile UInt32 *)mmio;
         stashed = true;
     }
 
-    // ---- SetNVMeProperties(): CAP = ReadRegister64(0) ---------------------
-    // Two 32-bit little-endian reads are equivalent to Apple's 64-bit read
-    // on little-endian x86 and avoid any 64-bit MMIO quirk; an unrouted MMIO
-    // path returns all-ones either way.
-    uint64_t cap = vmdReadCAP(mmio);
-
-    // VS (0x08), CC (0x14), CSTS (0x1C) — read-only samples.
-    uint32_t vs   = OSReadLittleInt32(mmio, NVME_REG_VS);
-    uint32_t cc   = OSReadLittleInt32(mmio, NVME_REG_CC);
-    uint32_t csts = OSReadLittleInt32(mmio, NVME_REG_CSTS);
-
-    uint32_t mqes   = (uint32_t)(cap & kNVMe_CAP_MQES_Mask);
-    uint32_t cqr    = (uint32_t)((cap & kNVMe_CAP_CQR_Mask)  >> 16);
-    uint32_t ams    = (uint32_t)((cap & kNVMe_CAP_AMS_Mask)  >> 17);
-    uint32_t to     = (uint32_t)((cap & kNVMe_CAP_TO_Mask)   >> 24);
-    uint32_t dstrd  = (uint32_t)((cap & kNVMe_CAP_DSTRD_Mask) >> 32);
-    uint32_t nssr   = (uint32_t)((cap & kNVMe_CAP_NSSR_Mask)  >> 36);
-    uint32_t cssNVM = (uint32_t)((cap & kNVMe_CAP_CommandSetSupported_NVM_Mask) >> 37);
-    uint32_t mpsmin = (uint32_t)((cap & kNVMe_CAP_MPS_Min_Mask) >> 48);
-    uint32_t mpsmax = (uint32_t)((cap & kNVMe_CAP_MPS_Max_Mask) >> 52);
-
-    nub2->setProperty("VMD-Dbg-CAP",     (unsigned long long)cap,  64);
-    nub2->setProperty("VMD-Dbg-VS",      (unsigned long long)vs,   32);
-    nub2->setProperty("VMD-Dbg-CC",      (unsigned long long)cc,   32);
-    nub2->setProperty("VMD-Dbg-CSTS",    (unsigned long long)csts, 32);
-    nub2->setProperty("VMD-Dbg-MQES",    (unsigned long long)mqes,   32);
-    nub2->setProperty("VMD-Dbg-CQR",     (unsigned long long)cqr,    32);
-    nub2->setProperty("VMD-Dbg-AMS",     (unsigned long long)ams,    32);
-    nub2->setProperty("VMD-Dbg-TO",      (unsigned long long)to,     32);
-    nub2->setProperty("VMD-Dbg-STRIDE",  (unsigned long long)dstrd,  32);
-    nub2->setProperty("VMD-Dbg-NSSR",    (unsigned long long)nssr,   32);
-    nub2->setProperty("VMD-Dbg-CSS-NVM", (unsigned long long)cssNVM, 32);
-    nub2->setProperty("VMD-Dbg-MPSMIN",  (unsigned long long)mpsmin, 32);
-    nub2->setProperty("VMD-Dbg-MPSMAX",  (unsigned long long)mpsmax, 32);
-    nub2->setProperty("VMD-Dbg-CSTS-RDY", (csts & kNVMe_CSTS_RDY_Mask) != 0);
-
-    // ---- Apple's four init guards, one registry flag each ----------------
-    bool capOK = (cap != kNVMeInvalidRegisterValue64);                    // :0x4d8
-    bool cssOK = (cap & kNVMe_CAP_CommandSetSupported_NVM_Mask) != 0;     // :0x4dd
-    bool mpsOK = (cap & kNVMe_CAP_MPS_Min_Mask) == 0;                     // :0x4e0
-    bool vsOK  = (vs   != kNVMeInvalidRegisterValue32);                   // :0x501
-
-    nub2->setProperty("VMD-Dbg-APL-CAP-OK",     capOK);
-    nub2->setProperty("VMD-Dbg-APL-CSS-NVM-OK", cssOK);
-    nub2->setProperty("VMD-Dbg-APL-MPSMIN-OK",  mpsOK);
-    nub2->setProperty("VMD-Dbg-APL-VS-OK",      vsOK);
-
-    // Apple-derived init parameters (SetNVMeProperties() +
-    // GetDefaultInitTimeout(): (CAP >> 24 & 0xFF) * 500 ms).
-    nub2->setProperty("VMD-Dbg-APL-InitTimeoutMS",
-                      (unsigned long long)to * 500, 32);
-
-    if (vsOK) {
-        // Apple publishes "NVMe Revision Supported" via snprintf("%u.%u%u");
-        // the conventional dotted form is easier to read in a registry dump.
-        char rev[16];
-        snprintf(rev, sizeof(rev), "%u.%u.%u",
-                 (unsigned)((vs >> 16) & 0xff),
-                 (unsigned)((vs >> 8)  & 0xff),
-                 (unsigned)( vs        & 0xff));
-        nub2->setProperty("VMD-Dbg-APL-Revision", rev);
+    
+    uint32_t cls = nub2->configRead32(kIOPCIConfigRevisionID) >> 16;
+    if (cls == VMD_CLASS_NVME)
+    {
+        
+        // ---- SetNVMeProperties(): CAP = ReadRegister64(0) ---------------------
+        // Two 32-bit little-endian reads are equivalent to Apple's 64-bit read
+        // on little-endian x86 and avoid any 64-bit MMIO quirk; an unrouted MMIO
+        // path returns all-ones either way.
+        uint64_t cap = vmdReadCAP(mmio);
+        
+        // VS (0x08), CC (0x14), CSTS (0x1C) — read-only samples.
+        uint32_t vs   = OSReadLittleInt32(mmio, NVME_REG_VS);
+        uint32_t cc   = OSReadLittleInt32(mmio, NVME_REG_CC);
+        uint32_t csts = OSReadLittleInt32(mmio, NVME_REG_CSTS);
+        
+        uint32_t mqes   = (uint32_t)(cap & kNVMe_CAP_MQES_Mask);
+        uint32_t cqr    = (uint32_t)((cap & kNVMe_CAP_CQR_Mask)  >> 16);
+        uint32_t ams    = (uint32_t)((cap & kNVMe_CAP_AMS_Mask)  >> 17);
+        uint32_t to     = (uint32_t)((cap & kNVMe_CAP_TO_Mask)   >> 24);
+        uint32_t dstrd  = (uint32_t)((cap & kNVMe_CAP_DSTRD_Mask) >> 32);
+        uint32_t nssr   = (uint32_t)((cap & kNVMe_CAP_NSSR_Mask)  >> 36);
+        uint32_t cssNVM = (uint32_t)((cap & kNVMe_CAP_CommandSetSupported_NVM_Mask) >> 37);
+        uint32_t mpsmin = (uint32_t)((cap & kNVMe_CAP_MPS_Min_Mask) >> 48);
+        uint32_t mpsmax = (uint32_t)((cap & kNVMe_CAP_MPS_Max_Mask) >> 52);
+        
+        nub2->setProperty("VMD-Dbg-CAP",     (unsigned long long)cap,  64);
+        nub2->setProperty("VMD-Dbg-VS",      (unsigned long long)vs,   32);
+        nub2->setProperty("VMD-Dbg-CC",      (unsigned long long)cc,   32);
+        nub2->setProperty("VMD-Dbg-CSTS",    (unsigned long long)csts, 32);
+        nub2->setProperty("VMD-Dbg-MQES",    (unsigned long long)mqes,   32);
+        nub2->setProperty("VMD-Dbg-CQR",     (unsigned long long)cqr,    32);
+        nub2->setProperty("VMD-Dbg-AMS",     (unsigned long long)ams,    32);
+        nub2->setProperty("VMD-Dbg-TO",      (unsigned long long)to,     32);
+        nub2->setProperty("VMD-Dbg-STRIDE",  (unsigned long long)dstrd,  32);
+        nub2->setProperty("VMD-Dbg-NSSR",    (unsigned long long)nssr,   32);
+        nub2->setProperty("VMD-Dbg-CSS-NVM", (unsigned long long)cssNVM, 32);
+        nub2->setProperty("VMD-Dbg-MPSMIN",  (unsigned long long)mpsmin, 32);
+        nub2->setProperty("VMD-Dbg-MPSMAX",  (unsigned long long)mpsmax, 32);
+        nub2->setProperty("VMD-Dbg-CSTS-RDY", (csts & kNVMe_CSTS_RDY_Mask) != 0);
+        
+        // ---- Apple's four init guards, one registry flag each ----------------
+        bool capOK = (cap != kNVMeInvalidRegisterValue64);                    // :0x4d8
+        bool cssOK = (cap & kNVMe_CAP_CommandSetSupported_NVM_Mask) != 0;     // :0x4dd
+        bool mpsOK = (cap & kNVMe_CAP_MPS_Min_Mask) == 0;                     // :0x4e0
+        bool vsOK  = (vs   != kNVMeInvalidRegisterValue32);                   // :0x501
+        
+        nub2->setProperty("VMD-Dbg-APL-CAP-OK",     capOK);
+        nub2->setProperty("VMD-Dbg-APL-CSS-NVM-OK", cssOK);
+        nub2->setProperty("VMD-Dbg-APL-MPSMIN-OK",  mpsOK);
+        nub2->setProperty("VMD-Dbg-APL-VS-OK",      vsOK);
+        
+        // Apple-derived init parameters (SetNVMeProperties() +
+        // GetDefaultInitTimeout(): (CAP >> 24 & 0xFF) * 500 ms).
+        nub2->setProperty("VMD-Dbg-APL-InitTimeoutMS",
+                          (unsigned long long)to * 500, 32);
+        
+        if (vsOK) {
+            // Apple publishes "NVMe Revision Supported" via snprintf("%u.%u%u");
+            // the conventional dotted form is easier to read in a registry dump.
+            char rev[16];
+            snprintf(rev, sizeof(rev), "%u.%u.%u",
+                     (unsigned)((vs >> 16) & 0xff),
+                     (unsigned)((vs >> 8)  & 0xff),
+                     (unsigned)( vs        & 0xff));
+            nub2->setProperty("VMD-Dbg-APL-Revision", rev);
+        }
+        
+        nub2->setProperty("VMD-Dbg-APL-InitOK", capOK && cssOK && mpsOK && vsOK);
     }
-
-    nub2->setProperty("VMD-Dbg-APL-InitOK", capOK && cssOK && mpsOK && vsOK);
-
+    
     if (!stashed) bar0->release();
 }
 
@@ -2689,10 +2482,7 @@ void VMDChildDevice::free(void)
     IOService::free();
 }
 
-/* Protected-member access helpers.  IOPCIDevice::reserved is protected, so
- * the access must happen from a context whose static type is VMDChildDevice
- * — hence the cast inside these static members.  Family-created IOPCIDevice
- * instances always have `reserved` allocated by initReserved(). */
+
 IOPCIConfigEntry * VMDChildDevice::configEntryOf(IOPCIDevice *device)
 {
     if (!device) return NULL;
@@ -2704,6 +2494,24 @@ IOInterruptVector * VMDChildDevice::msiVectorsOf(IOPCIDevice *device)
     if (!device) return NULL;
     return ((VMDChildDevice *)device)->reserved->msiVectors;
 }
+
+bool VMDChildDevice::handleOpen(IOService * forClient, IOOptionBits options, void * arg)
+{
+    this->setProperty("SERV", forClient->getName());
+    if (!strcmp(forClient->getName(),"IONVMeController"))
+    {
+        //getMember<void *>(forClient, 0x148)=rmmio;
+        
+        IOPCIDevice *rp, *nub2;
+        nub2 = this;
+        rp=OSDynamicCast(IOPCIDevice,nub2->getParentEntry( gIODTPlane));
+        pvmd->vmdBridgeCheck(rp, nub2);
+        
+    }
+    return IOPCIDevice::handleOpen(forClient,  options,  arg);
+}
+
+
 
 
 IOReturn VMDChildDevice::configureInterrupts(UInt32 interruptType,
@@ -2746,12 +2554,6 @@ IOReturn VMDChildDevice::registerInterrupt(int source, OSObject *target,
     return ret;
 }
 
-IOMemoryMap * VMDChildDevice::mapDeviceMemoryWithRegister(UInt8 reg,
-                                                          IOOptionBits options)
-{
-    if (reg==0x10 && rmmio) return rmmio;
-    return IOPCIDevice::mapDeviceMemoryWithRegister(reg, options);
-}
 
 void IOPCIConfigurator::doConfigure(uint32_t options)
 {

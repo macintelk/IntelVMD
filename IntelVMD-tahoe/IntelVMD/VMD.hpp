@@ -39,9 +39,10 @@
 
 #include "IOKit/pci/IOPCIPrivate.h"
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * Linux vmd.c definitions, ported verbatim where possible.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+template <typename T>
+inline T &getMember(void *that, size_t off) {
+    return *reinterpret_cast<T *>(static_cast<uint8_t *>(that) + off);
+}
 
 #define VMD_CFGBAR      0
 #define VMD_MEMBAR1     2
@@ -287,10 +288,9 @@ private:
     void vmdReassertSubtree(IOPCIConfigEntry *entry, int depth);
     /* endpoint behind a root port: ASPM off on both link partners, DLLLA
      * wait, vmdBridgeCheck(); NVMe-class also stabilize + Apple init probe */
-    void endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2, bool isNVMe);
+    void endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2);
     void appleNVMeInitDebug(IOPCIDevice *nub2);
-    void vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2);
-    bool stabilizeNVMeForCAP(IOPCIDevice *rp, IOPCIDevice *nub2);
+    
     void associateACPI(IOPCIConfigEntry *entry, IOPCIDevice *inheritFrom);
     void wireChildMSI(IOPCIDevice *nub);
     void enableLTRQuirk(IOPCIDevice *dev);
@@ -300,16 +300,12 @@ private:
                                IOInterruptEventSource *src, int count);
 
 public:
-    /* Linux vmd_compose_msi_msg() + vmd_next_irq() port.  Public: called
-     * from VMDChildDevice's configureInterrupts()/registerInterrupt()
-     * overrides -- the two points where IOPCIFamily writes a host-composed
-     * MSI message into the child. */
+    
+    void vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2);
+
     void composeChildMSI(IOPCIDevice *nub);
 
-    /* The VMD device's own host-bus nub.  VMDChildDevice::registerInterrupt
-     * registers Apple's (target, handler, refCon) directly on THIS device's
-     * MSI-X vector fVmdVector -- the exact entry the VMD MSI remap fires
-     * (Linux: vmd_irq() -> generic_handle_irq() demux). */
+
     IOPCIDevice * vmdDevice(void) const { return fPCIDev; }
 
     /* IOService */
@@ -323,11 +319,7 @@ public:
     virtual UInt8 lastBusNum(void) override;
     virtual IOPCIAddressSpace getBridgeSpace(void) override;
 
-    /* every domain nub's power transition lands here (IOPCIDevice::
-     * setPowerState -> parent->setDevicePowerState; initializeNub() sets
-     * nub->parent = this driver) — re-assert the decode chain after the
-     * stock restore (checkLink can zero bridge windows on a DLLLA==0
-     * sample). */
+
     virtual IOReturn setDevicePowerState(IOPCIDevice *device,
                                          unsigned long whatToDo) override;
 
@@ -363,15 +355,7 @@ public:
     
 };
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * VMDChildDevice — nub for every PCI device behind the VMD root complex.
- *
- * Created by VMDDriver::createNub() during the IOPCIFamily scan.  Config
- * cycles are answered from the VMD ECAM (a child device has no host-bus
- * presence).  The nub carries the ACPI association required by Apple's
- * IONVMeFamily (IONVMeController::CopyACPIParent asserts 0 != acpiRoot-
- * Device; see VMDDriver::associateACPI).
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 class VMDChildDevice : public IOPCIDevice
 {
     OSDeclareDefaultStructors(VMDChildDevice)
@@ -404,12 +388,7 @@ public:
     
     virtual IOWorkLoop * getWorkLoop(void) const override;
     virtual void free(void) override;
-
-
-    virtual IOMemoryMap * mapDeviceMemoryWithRegister(
-                            UInt8 reg, IOOptionBits options = 0) override;
-    void reassertDecodeChain(const char *why);
-
+    virtual bool handleOpen(IOService * forClient, IOOptionBits options, void * arg) override;
     
     static IOPCIConfigEntry * configEntryOf(IOPCIDevice *device);
     static IOInterruptVector * msiVectorsOf(IOPCIDevice *device);
