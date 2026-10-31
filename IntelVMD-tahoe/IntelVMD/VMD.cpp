@@ -7,19 +7,8 @@
 OSDefineMetaClassAndStructors(VMDDriver, IOPCI2PCIBridge)
 OSDefineMetaClassAndStructors(VMDChildDevice, IOPCIDevice)
 
-/* --------------------------------------------------------------------------
- * VMDACPIDevice — OSDynamicCast(IOACPIPlatformDevice, ...) replacement.
- *
- * OSDynamicCast against IOACPIPlatformDevice emits a reference to
- * IOACPIPlatformDevice::metaClass, which AppleACPIPlatform does not export
- * to third-party kexts (kmutil: "could not find a kext which exports this
- * symbol").  Every object passed here comes from a source that IOPCIFamily /
- * AppleACPIPlatform itself populated (IOPCI2PCIBridge::acpiDevice, the
- * "acpi-device" property published on PCI nubs), so the IORegistryEntry
- * base class is checked at runtime and the pointer is then cast through —
- * the chain IOACPIPlatformDevice : IOService : IORegistryEntry : OSObject
- * is single-inheritance, so the pointer value is unchanged.
- * ------------------------------------------------------------------------ */
+VMDDriver * pvmd;
+
 static IOACPIPlatformDevice * VMDACPIDevice(OSObject * object)
 {
     IORegistryEntry * entry = OSDynamicCast(IORegistryEntry, object);
@@ -254,7 +243,6 @@ void VMDDriver::configWrite8(IOPCIAddressSpace space, UInt8 offset, UInt8 data)
 
 UInt32 VMDChildDevice::configRead32(IOPCIAddressSpace space, UInt8 offset)
 {
-    if (!pvmd) return 0xFFFFFFFF;
     return pvmd->configRead32(space, offset);
 }
 
@@ -265,7 +253,6 @@ void VMDChildDevice::configWrite32(IOPCIAddressSpace space, UInt8 offset, UInt32
 
 UInt16 VMDChildDevice::configRead16(IOPCIAddressSpace space, UInt8 offset)
 {
-    if (!pvmd) return 0xFFFF;
     return pvmd->configRead16(space, offset);
 }
 
@@ -276,7 +263,6 @@ void VMDChildDevice::configWrite16(IOPCIAddressSpace space, UInt8 offset, UInt16
 
 UInt8 VMDChildDevice::configRead8(IOPCIAddressSpace space, UInt8 offset)
 {
-    if (!pvmd) return 0xFF;
     return pvmd->configRead8(space, offset);
 }
 
@@ -285,15 +271,6 @@ void VMDChildDevice::configWrite8(IOPCIAddressSpace space, UInt8 offset, UInt8 d
     if (pvmd) pvmd->configWrite8(space, offset, data);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * Capability walks.
- *
- * Convention (Apple IOPCIFamily): for extended capabilities the caller
- * passes the NEGATED capability ID (>= 0x100); the walk goes through the
- * 12-bit extended capability chain.  The full offset rides in
- * es.registerNumExtended and is applied by ecamFullOffset() inside the
- * config accessors above.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 UInt32 VMDDriver::findPCICapability(IOPCIAddressSpace space, UInt8 capabilityID,
                                     UInt8 *found)
@@ -1002,6 +979,7 @@ bool VMDDriver::decodeAndPublishBars(void)
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 bool VMDDriver::start(IOService *provider)
 {
+    pvmd=this;
     if (!vmdProbe(provider)) {
         IOLog("IntelVMD: probe failed\n");
         return false;
@@ -1565,24 +1543,11 @@ static void vmdFixBridgeWindows(IOPCIConfigEntry *bridge,
     }
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * postScanConfigure driver:
- *
- *   - resetDomain() runs ONCE over the whole ECAM (it only closes bridge
- *     windows; a real secondary-bus reset would zero the endpoints' BARs
- *     and command register — the two-argument IOPCIDevice::reset() is not
- *     exported by IOPCIFamily, so windows-only is what we can safely do),
- *   - then EVERY child of the VMD root complex gets configureChildDevice():
- *     the mirrored AHCI (e.g. 8086:a0d3 at dev 0x17), the fixed root port
- *     (8086:09ab), the active root port (8086:a0bc) and the NVMe endpoint
- *     behind it.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::postScanConfigure(void)
 {
     if (!fBridgeEntry) {
-        // silent-exit killer: without the bridge entry the whole per-device
-        // fix-up pass (windows, MSI wiring, CAP probe) would never run and
-        // nothing in the registry would ever say why.
+
         fPCIDev->setProperty("VMD-Stage-PostScan-Fail", "no-bridge-entry");
         return;
     }
@@ -1607,34 +1572,12 @@ void VMDDriver::postScanConfigure(void)
     fPCIDev->setProperty("VMD-Stage-PostScan-Children", configured, 32);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * setDevicePowerState — IOPCIBridge virtual.  initializeNub() sets
- * nub->parent = the bridge that probed it — for EVERY device in the VMD
- * domain that is THIS driver — so each domain nub's power transition
- * (IOPCIDevice::setPowerState -> parent->setDevicePowerState) lands here,
- * including the NVMe endpoint's D0 right before Apple's InitializePCI()
- * reads CAP.
- *
- * The stock path can clobber the decode chain: IOPCI2PCIBridge power
- * management runs checkLink(), which zeroes the bridge windows when it
- * samples LNKSTA.DLLLA == 0 (IOPCIBridge.cpp:4905-4908 — the Boot-3
- * "clobbered between postScanConfigure() and Apple's first MMIO read"
- * evidence).  Re-assert the whole decode chain AFTER the stock call, i.e.
- * after any such clobber and before Apple's driver code runs — this is the
- * replacement for the dead VMDChildDevice::start()/
- * mapDeviceMemoryWithRegister() hooks (stock nubs, no overrides).
- *
- * Registry-only breadcrumbs (no IOLog), on the waking nub:
- *   VMD-PM-Hook       the whatToDo argument of this call
- *   VMD-PM-Reassert   depth of this nub in the re-assert walk
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 IOReturn VMDDriver::setDevicePowerState(IOPCIDevice *device,
                                         unsigned long whatToDo)
 {
     IOReturn ret = IOPCI2PCIBridge::setDevicePowerState(device, whatToDo);
 
-    // skip the sleep-save call (kIOPCIConfigShadowPermanent): re-asserting
-    // decode bits on a device being powered down would undo the save path.
     if (device && (device != fPCIDev) && fBridgeEntry
         && !(whatToDo & kIOPCIConfigShadowPermanent)) {
         device->setProperty("VMD-PM-Hook", (unsigned long long)whatToDo, 32);
@@ -1643,12 +1586,7 @@ IOReturn VMDDriver::setDevicePowerState(IOPCIDevice *device,
     return ret;
 }
 
-/* vmdReassertAll — power-management-safe re-run of the decode fix-up:
- * D0 + command decode on every nub, bridge windows over all downstream
- * BARs, entry ranges + save/restore shadow re-sync.  Idempotent; the tree
- * is tiny (root port + endpoint + mirrored functions), so this is a
- * handful of config writes.  No sleeps, no MSI work (interrupts are owned
- * by the model chosen in vmdProbe). */
+
 void VMDDriver::vmdReassertAll(void)
 {
     for (IOPCIConfigEntry *child = fBridgeEntry->child; child;
@@ -1681,20 +1619,7 @@ void VMDDriver::vmdReassertSubtree(IOPCIConfigEntry *entry, int depth)
         vmdReassertSubtree(c, depth + 1);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * configureChildDevice — the recursive per-device fix-up.  Every device
- * keeps its own IOPCIConfigEntry; all of them are brought up and synced:
- *
- *   1. ACPI companion (endpoints inherit the root port's association),
- *   2. LTR quirk,
- *   3. D0 + command.MEM/BUS-MASTER,
- *   4. bridges: windows over ALL downstream BARs + entry range sync,
- *   5. IOPCIConfigEntry ranges + save/restore shadow := fixed hardware,
- *   6. child MSI wiring onto the VMD's own MSI-X vectors,
- *   7. endpoints behind a root port: link prep (ASPM off, DLLLA wait);
- *      NVMe-class endpoints: + vmdBridgeCheck/stabilize/apple probe,
- *   8. recurse into the bridge's children.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
                                      IOPCIDevice *parentNub, int depth)
 {
@@ -1713,8 +1638,8 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
     nub->setProperty("VMD-Cfg-Visited", depth, 32);
 
     // Dead in ECAM — skip the whole subtree.
-    UInt16 vid = nub->configRead16(kIOPCIConfigVendorID);
-    if (vid == 0xFFFF) {
+    UInt16 vid = nub->configRead16(kIOPCIConfigCommand);
+    if (vid == 0) {
         nub->setProperty("VMD-Cfg-Dead", true);
         return;
     }
@@ -1738,7 +1663,7 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
     vmdSyncConfigEntry(nub, entry, isBridge);
 
     // 6. child MSI wiring onto the VMD's own MSI-X vectors (irq demux)
-    wireChildMSI(nub);
+    if (!isBridge) wireChildMSI(nub);
 
     // 7. endpoint behind a root port: link prep; NVMe: + controller probe
     if (!isBridge && parentNub) {
@@ -1751,35 +1676,13 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
         configureChildDevice(child, nub, depth + 1);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * endpointLinkPrep — per-endpoint work that needs the root port nub:
- *
- *   - ASPM off on BOTH link partners (direct LNKCTL writes + the
- *     "pci-aspm-default" OSData for later re-probes),
- *   - DLLLA wait so the link is up before Apple's first MMIO read,
- *   - vmdBridgeCheck() — VMD-device -> root-port -> endpoint decode chain
- *     diagnostics + fixes (idempotent after the generic steps above),
- *   - NVMe-class endpoints only: stabilizeNVMeForCAP() (read-only CAP poll
- *     with decode-toggle / retrain kicks) and appleNVMeInitDebug() (Apple's
- *     InitializePCI()/SetNVMeProperties() probe, registry-only).
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2,
                                  bool isNVMe)
 {
     if (!rp || !nub2) return;
 
-    // --- ASPM off on the NVMe link (both link partners) ----------------------
-    //
-    // The only ASPM key IOPCIFamily consumes is kIOPCIExpressASPMDefaultKey
-    // = "pci-aspm-default", resolved in IOPCIBridge::probeBusGated() during
-    // the scan pass that creates these nubs — i.e. BEFORE postScanConfigure()
-    // runs — and ONLY as a 4-byte OSData.  Encoding = LNKCTL.ASPMControl:
-    // 0 = off, 1 = L0s, 2 = L1, 3 = L0s+L1.  What flips the link state right
-    // now is the DIRECT LNKCTL config write on BOTH ends below (the same
-    // runtime mechanism NVMeFix uses; we force 0 for bring-up).  The OSData
-    // property is still injected so later re-probes (rescan / hot-plug /
-    // wake re-probe) resolve ASPM = 0 instead of the hardware default.
-    uint32_t aspmOff = 0;               /* kIOPCILinkControlASPMBitsDisabled */
+    uint32_t aspmOff = 0;
     OSData *aspmProp = OSData::withBytes(&aspmOff, sizeof(aspmOff));
     if (aspmProp) {
         nub2->setProperty(kIOPCIExpressASPMDefaultKey, aspmProp);
@@ -2443,41 +2346,13 @@ void VMDDriver::associateACPI(IOPCIConfigEntry *entry, IOPCIDevice *inheritFrom)
     }
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * Child MSI wiring — the irq_domain equivalent (vmd_compose_msi_msg +
- * vmd_next_irq + vmd_irq demux).
- *
- * With MSI remapping enabled, the VMD routes a child's MSI to its own
- * MSI-X table entry selected by the message DESTINATION ID.  IOPCIFamily
- * composes host messages (destid = CPU APIC id) and rewrites them at BOTH
- * configureInterrupts() and registerInterrupt() time, so the rewrite runs
- * from:
- *   - wireChildMSI()          (scan time, before Apple matches),
- *   - VMDChildDevice::configureInterrupts()  (Apple: CreateDeviceInterrupt,
- *                              IONVMeFamilyTA.c:9544),
- *   - VMDChildDevice::registerInterrupt()    (Apple's IOFilterInterrupt-
- *                              EventSource attach — the LAST message write),
- * and is idempotent: the vector is allocated once per child and reused.
- *
- * The dispatch side lives in VMDChildDevice::registerInterrupt(): Apple's
- * (target, handler, refCon) is registered DIRECTLY on the VMD device at
- * MSI-X vector fVmdVector, so IOPCIMessagedInterruptController programs
- * VMD MSI-X entry <fVmdVector> with a real host message and dispatches it
- * straight to Apple's IOInterruptEventSource (Linux: vmd_irq() ->
- * generic_handle_irq()).  The child's own stock registration is kept for
- * IOPCIFamily bookkeeping only; it can never dispatch, because the child's
- * MSI is intercepted by the VMD and never reaches the CPU directly.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::wireChildMSI(IOPCIDevice *nub)
 {
     if (!nub) return;
 
-    // breadcrumb FIRST — every early exit below must leave a trace
     nub->setProperty("VMD-MSI-Pass", true);
 
-    // give the child a messaged interrupt before Apple matches, then
-    // compose it for the VMD (dispatch wiring happens later, in
-    // VMDChildDevice::registerInterrupt, once Apple provides a handler)
     if (!nub->getProperty("IOPCIMSIMode")) {
         IOReturn r = nub->configureInterrupts(kIOInterruptTypePCIMessaged,
                                               1, 1);
@@ -2487,68 +2362,12 @@ void VMDDriver::wireChildMSI(IOPCIDevice *nub)
     composeChildMSI(nub);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * composeChildMSI — Linux vmd_compose_msi_msg(), ported.
- *
- *   msg->address_hi = X86_MSI_BASE_ADDRESS_HIGH;
- *   msg->arch_addr_lo.base_address = X86_MSI_BASE_ADDRESS_LOW;
- *   msg->arch_addr_lo.destid_0_7   = index_from_irqs(vmd, irq);
- *
- * I.e. the child's MSI message must be
- *
- *   address = 0xFEE00000 | (vmdVector << 12),  data = vmdVector
- *
- * where vmdVector indexes the VMD device's OWN MSI-X table (programmed
- * with real host vectors by IOPCIDevice::configureInterrupts on fPCIDev —
- * setupMSIX()).  Vector choice mirrors Linux vmd_next_irq(): NVMe devices
- * (class 0x0108) get a private vector (first_vec+1 …), everything else
- * shares first_vec.
- *
- * After rewriting the message the child's config shadow is refreshed so a
- * later save/restore cycle cannot resurrect the host-composed message.
- * Dispatch wiring is NOT done here — see VMDChildDevice::registerInterrupt.
- *
- * Registry-only diagnostics (no IOLog), published on the child nub:
- *   VMD-MSI-Mode         "MSI-X" / "MSI"
- *   VMD-MSI-Vec          VMD MSI-X vector index used as destid
- *   VMD-MSI-AddrLo       composed message address (0xFEE00000|vec<<12)
- *   VMD-MSI-Verify       read-back of MSI-X table entry 0 address
- *   VMD-MSI-Verify-Ctrl  read-back of MSI-X table entry 0 vector-control
- *   VMD-MSI-MSIX-En-Fixed  child MSI-X Enable was set by this driver
- *   VMD-MSI-MSI-En-Fixed   child MSI Enable was set by this driver
- *   VMD-MSI-MSI-Cleared    child MSI Enable cleared for the MSI-X switch
- *   VMD-MSI-Host-AddrLo  VMD's own MSI-X entry <vec> address readback
- *   VMD-MSI-Host-Ctrl    VMD's own MSI-X entry <vec> vector-control
- *
- * Gate breadcrumbs (wireChildMSI / composeChildMSI) — set INSTEAD of the
- * old silent early-returns, so a missing VMD-MSI-* tree in the registry is
- * itself diagnostic:
- *   VMD-MSI-Model         "bypass-stock" (compose skipped: stock MSI path
- *                         owns the child) / "demux" on the VMD node
- *   VMD-MSI-Pass          wireChildMSI() entered for this nub
- *   VMD-MSI-Cfg-Stat      wireChildMSI's own configureInterrupts() result
- *   VMD-MSI-NoVmdDev      fPCIDev missing (should never happen)
- *   VMD-MSI-NoMsixTable   fMsixCount == 0 (setupMSIX() did not size a table;
- *                         normal in bypass mode — gate is reached first)
- *   VMD-MSI-NoMessageCap  device has neither a writable MSI-X table nor a
- *                         programmable MSI capability
- * On the VMD node itself: VMD-Stage-* (start pipeline), VMD-MSIX-* (the
- * VMD device's own MSI-X setup), VMD-Stage-Scan-Children /
- * VMD-Stage-PostScan-* (scan + fix-up pass census), VMD-MSI-Model.
- * Power path: VMD-PM-Hook / VMD-PM-Reassert on each waking nub.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::composeChildMSI(IOPCIDevice *nub)
 {
     if (!nub) return;
 
-    // The configurator scan builds stock IOPCIDevice nubs
-    // (IOPCIConfigurator.cpp: OSTypeAlloc(IOPCIDevice) — createNub() is
-    // never called on this path), so there is no VMDChildDevice here and
-    // no per-child fVmdVector ivar: the vector lives in the nub's own
-    // "VMD-MSI-Vec" property instead.  Under the bypass model nothing is
-    // composed at all — the stock messaged-interrupt controller owns the
-    // child's MSI message end to end (Linux vmd_probe(): bypass devices
-    // create no irq_domain, linuxvmd.c:991).
+
     if (!fDemuxMode) {
         nub->setProperty("VMD-MSI-Model", "bypass-stock");
         return;
@@ -2569,8 +2388,7 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
         OSDynamicCast(OSNumber, nub->getProperty("VMD-MSI-Vec"));
     if (!vecProp) {
         uint32_t nv;
-        if ((cls == VMD_CLASS_NVME)
-            && (fMsixCount > (uint32_t)fFirstVec + 1)
+        if ((fMsixCount > (uint32_t)fFirstVec + 1)
             && (fNextFreeVec < fMsixCount)) {
             nv = fNextFreeVec++;
         } else {
@@ -2588,9 +2406,40 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
     }
 
     bool wrote = false;
-
-    // ---- MSI-X: rewrite the table entries inside the device's BAR ------
     uint8_t cap = 0;
+    
+    // MSI 1st place
+    if (!wrote
+        && nub->findPCICapability(kIOPCICapabilityIDMSI, &cap) && cap) {
+        uint16_t ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
+        nub->setProperty("VMD-MSI-Mode", "MSI");
+        if (((ctrl & PCI_MSI_FLAGS_ENABLE) == 0) && (cls == VMD_CLASS_NVME)) {
+            // No messaged interrupt was ever enabled on the device (stock
+            // configureInterrupts() failed or was never run) — a disabled
+            // MSI block can never fire.  Enable it ourselves.
+            ctrl |= PCI_MSI_FLAGS_ENABLE;
+            nub->configWrite16(cap + PCI_MSI_FLAGS, ctrl);
+            ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
+            if (ctrl & PCI_MSI_FLAGS_ENABLE)
+                nub->setProperty("VMD-MSI-MSI-En-Fixed", true);
+        }
+        if (ctrl & PCI_MSI_FLAGS_ENABLE) {
+            nub->configWrite32(cap + PCI_MSI_MSG_LOWER_ADDRESS, addrLo);
+            if (ctrl & PCI_MSI_FLAGS_64BIT) {
+                nub->configWrite32(cap + PCI_MSI_MSG_UPPER_ADDRESS, addrHi);
+                nub->configWrite16(cap + PCI_MSI_MSG_DATA_64, (UInt16)vec);
+            } else {
+                nub->configWrite16(cap + PCI_MSI_MSG_DATA_32, (UInt16)vec);
+            }
+            nub->setProperty("VMD-MSI-AddrLo",
+                             (unsigned long long)addrLo, 32);
+            wrote = true;
+        }
+    }
+    
+
+    // MSI-X 2nd place
+    if (!wrote)
     if (nub->findPCICapability(kIOPCICapabilityIDMSIX, &cap) && cap) {
         uint16_t ctrl = nub->configRead16(cap + PCI_MSIX_FLAGS);
         nub->setProperty("VMD-MSI-Mode", "MSI-X");
@@ -2655,87 +2504,21 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
         }
     }
 
-    // ---- MSI: rewrite the capability message ----------------------------
-    if (!wrote
-        && nub->findPCICapability(kIOPCICapabilityIDMSI, &cap) && cap) {
-        uint16_t ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
-        nub->setProperty("VMD-MSI-Mode", "MSI");
-        if (((ctrl & PCI_MSI_FLAGS_ENABLE) == 0) && (cls == VMD_CLASS_NVME)) {
-            // No messaged interrupt was ever enabled on the device (stock
-            // configureInterrupts() failed or was never run) — a disabled
-            // MSI block can never fire.  Enable it ourselves.
-            ctrl |= PCI_MSI_FLAGS_ENABLE;
-            nub->configWrite16(cap + PCI_MSI_FLAGS, ctrl);
-            ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
-            if (ctrl & PCI_MSI_FLAGS_ENABLE)
-                nub->setProperty("VMD-MSI-MSI-En-Fixed", true);
-        }
-        if (ctrl & PCI_MSI_FLAGS_ENABLE) {
-            nub->configWrite32(cap + PCI_MSI_MSG_LOWER_ADDRESS, addrLo);
-            if (ctrl & PCI_MSI_FLAGS_64BIT) {
-                nub->configWrite32(cap + PCI_MSI_MSG_UPPER_ADDRESS, addrHi);
-                nub->configWrite16(cap + PCI_MSI_MSG_DATA_64, (UInt16)vec);
-            } else {
-                nub->configWrite16(cap + PCI_MSI_MSG_DATA_32, (UInt16)vec);
-            }
-            nub->setProperty("VMD-MSI-AddrLo",
-                             (unsigned long long)addrLo, 32);
-            wrote = true;
-        }
-    }
+    
 
     if (!wrote) {
-        // neither a writable MSI-X table nor a programmable MSI capability
         nub->setProperty("VMD-MSI-NoMessageCap", true);
         return;
     }
 
-    // ---- evidence: VMD's own MSI-X entry <vec> carries the host message ------
-    {
-        uint8_t hcap = 0;
-        if (fPCIDev->findPCICapability(kIOPCICapabilityIDMSIX, &hcap)
-            && hcap) {
-            uint32_t htobir =
-                fPCIDev->configRead32(hcap + PCI_MSIX_TABLE_OFFSET);
-            uint8_t  hbir  = htobir & 7;
-            uint64_t htoff = htobir & ~7ULL;
-            IOMemoryMap *hbar = fPCIDev->mapDeviceMemoryWithRegister(
-                        kIOPCIConfigBaseAddress0 + 4 * hbir,
-                        kIOMapInhibitCache | kIOMapAnywhere);
-            if (hbar) {
-                volatile UInt8 *htab =
-                    (volatile UInt8 *)hbar->getVirtualAddress() + htoff;
-                volatile UInt32 *hentry = (volatile UInt32 *)
-                    (htab + (uint32_t)vec * PCI_MSIX_ENTRY_SIZE);
-                nub->setProperty("VMD-MSI-Host-AddrLo",
-                    OSReadLittleInt32(hentry, PCI_MSIX_ENTRY_LOWER_ADDR),
-                    32);
-                nub->setProperty("VMD-MSI-Host-Ctrl",
-                    OSReadLittleInt32(hentry, PCI_MSIX_ENTRY_VECTOR_CTRL),
-                    32);
-                hbar->release();
-            }
-        }
-    }
 
-    // ---- refresh the config shadow: a later save/restore cycle must not
-    //      resurrect the host-composed message ----------------------------
     IOPCIConfigShadow *shadow = configShadow(nub);
     if (shadow)
         for (int i = 0; i < kIOPCIConfigEPShadowRegs; i++)
             shadow->configSave.savedConfig[i] = nub->configRead32(i * 4);
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * vmd_pm_enable_quirk() — BIOS-PM quirk.
- *
- * "Enable ASPM and LTR settings on devices that aren't configured by BIOS."
- * If the LTR max-snoop/max-no-snoop values are zero, program the platform
- * default (0x1003 = 3145728 ns) so the device can reach the deepest
- * power-management savings.  Extended capabilities live at offsets >=
- * 0x100, so the 12-bit offset is carried explicitly through
- * es.registerNumExtended (see ecamFullOffset()).
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
 void VMDDriver::enableLTRQuirk(IOPCIDevice *dev)
 {
     if (!dev || !(fFeatures & VMD_FEAT_BIOS_PM_QUIRK)) return;
@@ -2966,7 +2749,7 @@ IOReturn VMDChildDevice::registerInterrupt(int source, OSObject *target,
 IOMemoryMap * VMDChildDevice::mapDeviceMemoryWithRegister(UInt8 reg,
                                                           IOOptionBits options)
 {
-    //if (reg==0x10 && rmmio) return rmmio;
+    if (reg==0x10 && rmmio) return rmmio;
     return IOPCIDevice::mapDeviceMemoryWithRegister(reg, options);
 }
 

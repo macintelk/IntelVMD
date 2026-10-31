@@ -377,20 +377,12 @@ class VMDChildDevice : public IOPCIDevice
     OSDeclareDefaultStructors(VMDChildDevice)
 
 public:
-    VMDDriver * pvmd;
+    
     IOMemoryMap *rmmio {nullptr};
     volatile UInt32 *rmmioPtr {nullptr};
-    /* VMD MSI-X vector index this child uses as its MSI destination id
-     * (0xFFFFFFFF = not yet allocated; see VMDDriver::composeChildMSI). */
     uint32_t fVmdVector {0xFFFFFFFF};
 
-    /* IOPCIFamily writes a host-composed MSI message into the device at
-     * BOTH of these points (configureInterrupts allocates the vector,
-     * registerInterrupt programs the message).  Each override lets the
-     * stock call run, then rewrites the message to the VMD-composed one.
-     * registerInterrupt() also registers Apple's (target, handler, refCon)
-     * directly on the VMD device's MSI-X vector fVmdVector -- the entry the
-     * VMD remap fires -- so the completion interrupt reaches Apple. */
+
     virtual IOReturn configureInterrupts(UInt32 interruptType,
                                          UInt32 numRequired,
                                          UInt32 numRequested,
@@ -409,27 +401,6 @@ public:
     virtual void configWrite8( IOPCIAddressSpace space,
                                         UInt8 offset, UInt8 data ) override;
 
-    /* One-argument convenience forms.  Declaring the (space, offset)
-     * overrides above NAME-HIDES every base-class overload with the same
-     * name, so unqualified configRead*(offset) calls inside VMDChildDevice
-     * members (reassertDecodeChain) stop compiling ("too few arguments,
-     * expected 2").  The base-class 1-arg VIRTUAL forms only exist under
-     * __IOPCIDEVICE_INTERNAL__; a third-party build sees only the inline
-     * IOByteCount forms, which route through extendedConfigRead* — NOT
-     * through pvmd's ECAM path.  Re-declare them here: same ECAM routing
-     * as the overrides above, using IOPCIDevice's public own-space member. */
-    UInt32 configRead32( UInt8 offset ) {
-        return pvmd ? pvmd->configRead32(space, offset) : 0xFFFFFFFF; }
-    void configWrite32( UInt8 offset, UInt32 data ) {
-        if (pvmd) pvmd->configWrite32(space, offset, data); }
-    UInt16 configRead16( UInt8 offset ) {
-        return pvmd ? pvmd->configRead16(space, offset) : 0xFFFF; }
-    void configWrite16( UInt8 offset, UInt16 data ) {
-        if (pvmd) pvmd->configWrite16(space, offset, data); }
-    UInt8 configRead8( UInt8 offset ) {
-        return pvmd ? pvmd->configRead8(space, offset) : 0xFF; }
-    void configWrite8( UInt8 offset, UInt8 data ) {
-        if (pvmd) pvmd->configWrite8(space, offset, data); }
     
     virtual IOWorkLoop * getWorkLoop(void) const override;
     virtual void free(void) override;
@@ -439,7 +410,7 @@ public:
                             UInt8 reg, IOOptionBits options = 0) override;
     void reassertDecodeChain(const char *why);
 
-
+    
     static IOPCIConfigEntry * configEntryOf(IOPCIDevice *device);
     static IOInterruptVector * msiVectorsOf(IOPCIDevice *device);
 };
