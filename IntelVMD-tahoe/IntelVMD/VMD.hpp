@@ -359,14 +359,14 @@ public:
 class VMDChildDevice : public IOPCIDevice
 {
     OSDeclareDefaultStructors(VMDChildDevice)
-
+    
 public:
     
     IOMemoryMap *rmmio {nullptr};
     volatile UInt32 *rmmioPtr {nullptr};
     uint32_t fVmdVector {0xFFFFFFFF};
-
-
+    
+    
     virtual IOReturn configureInterrupts(UInt32 interruptType,
                                          UInt32 numRequired,
                                          UInt32 numRequested,
@@ -374,24 +374,24 @@ public:
     virtual IOReturn registerInterrupt(int source, OSObject *target,
                                        IOInterruptAction handler,
                                        void *refCon = 0) override;
-
+    
     virtual UInt32 configRead32( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite32( IOPCIAddressSpace space,
-                                        UInt8 offset, UInt32 data ) override;
+                               UInt8 offset, UInt32 data ) override;
     virtual UInt16 configRead16( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite16( IOPCIAddressSpace space,
-                                        UInt8 offset, UInt16 data ) override;
+                               UInt8 offset, UInt16 data ) override;
     virtual UInt8 configRead8( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite8( IOPCIAddressSpace space,
-                                        UInt8 offset, UInt8 data ) override;
-
+                              UInt8 offset, UInt8 data ) override;
+    
     
     virtual IOWorkLoop * getWorkLoop(void) const override;
     virtual void free(void) override;
     virtual bool handleOpen(IOService * forClient, IOOptionBits options, void * arg) override;
     
     static IOPCIConfigEntry * configEntryOf(IOPCIDevice *device);
-    static IOInterruptVector * msiVectorsOf(IOPCIDevice *device);
+    
 };
 
 #endif /* VMDDriver_h */

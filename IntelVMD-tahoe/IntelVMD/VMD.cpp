@@ -2489,12 +2489,6 @@ IOPCIConfigEntry * VMDChildDevice::configEntryOf(IOPCIDevice *device)
     return ((VMDChildDevice *)device)->reserved->configEntry;
 }
 
-IOInterruptVector * VMDChildDevice::msiVectorsOf(IOPCIDevice *device)
-{
-    if (!device) return NULL;
-    return ((VMDChildDevice *)device)->reserved->msiVectors;
-}
-
 bool VMDChildDevice::handleOpen(IOService * forClient, IOOptionBits options, void * arg)
 {
     this->setProperty("SERV", forClient->getName());
@@ -2550,7 +2544,7 @@ IOReturn VMDChildDevice::registerInterrupt(int source, OSObject *target,
         setProperty("VMD-MSI-Direct-Stat", r, 32);
     }
 
-    if (pvmd) pvmd->composeChildMSI(this);
+    //if (pvmd) pvmd->composeChildMSI(this);// msi-x only
     return ret;
 }
 
