@@ -118,6 +118,11 @@ enum vmd_features {
 #define kACPIDevicePathKey      "acpi-path"
 #endif
 
+template <class T, size_t N>
+constexpr size_t arrsize(const T (&array)[N]) {
+    return N;
+}
+
 class VMDChildDevice;
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *

@@ -1047,6 +1047,7 @@ void VMDDriver::postScanConfigure(void)
 {
     if (!fBridgeEntry) return;
 
+    
     for (IOPCIConfigEntry *child = fBridgeEntry->child; child; child = child->peer) {
         IOPCIDevice *nub = OSDynamicCast(IOPCIDevice, child->dtNub);
         if (!nub) continue;
@@ -1060,6 +1061,7 @@ void VMDDriver::postScanConfigure(void)
 
         wireChildMSI(nub);
 
+            
         if (child->isBridge) {
             // pci_reset_bus() analogue — Linux: pci_bus_save_and_disable(),
             // pci_bridge_secondary_bus_reset(), pci_bus_restore().  The
@@ -1106,7 +1108,7 @@ void VMDDriver::postScanConfigure(void)
 
             enableLTRQuirk(nub2);
             wireChildMSI(nub2);
-
+            
             IOLog("IntelVMD: endpoint %02x:%02x.%x configured\n",
                   child2->space.s.busNum, child2->space.s.deviceNum,
                   child2->space.s.functionNum);

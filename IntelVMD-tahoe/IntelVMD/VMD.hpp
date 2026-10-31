@@ -124,6 +124,45 @@ enum vmd_features {
 #define PCI_EXP_LNKSTA_DLLLA    0x2000  /* LNKSTA.DLL Link Active         */
 #define PCI_EXP_LNKSTA_TRAINING 0x0800  /* LNKSTA.Link Training           */
 
+/* x86 MSI message layout (Linux vmd_compose_msi_msg / asm/msi.h).
+ *
+ * With VMCONFIG.MSI_REMAP clear the VMD hardware intercepts memory-write
+ * TLPs issued by domain devices to the local-APIC MSI address window and
+ * fires its OWN MSI-X table entry selected by the message DESTINATION ID
+ * (address bits 19:12):
+ *
+ *     MSI address = 0xFEE00000 | (vmdVector << 12)
+ *
+ * IOPCIFamily composes ordinary host messages (destid = CPU APIC id), so
+ * a child MSI would light up the VMD MSI-X entry numbered by the CPU APIC
+ * id -- where nothing is listening.  Linux fixes the message itself
+ * (vmd_compose_msi_msg); composeChildMSI() is that exact analogue. */
+#define X86_MSI_BASE_ADDRESS_LOW    0xFEE00000U
+#define X86_MSI_BASE_ADDRESS_HIGH   0x00000000U
+#define X86_MSI_DESTID_SHIFT        12
+
+/* MSI-X capability (pci_regs.h). */
+#define PCI_MSIX_FLAGS              2       /* Message Control (16-bit)   */
+#define PCI_MSIX_FLAGS_ENABLE       0x8000
+#define PCI_MSIX_TABLE_OFFSET       4       /* Table Offset / BIR (32-bit)*/
+#define PCI_MSIX_ENTRY_SIZE         16
+#define PCI_MSIX_ENTRY_LOWER_ADDR   0
+#define PCI_MSIX_ENTRY_UPPER_ADDR   4
+#define PCI_MSIX_ENTRY_DATA         8
+#define PCI_MSIX_ENTRY_VECTOR_CTRL  12      /* Vector Control, bit 0 = Mask */
+
+/* MSI capability (pci_regs.h). */
+#define PCI_MSI_FLAGS               2       /* Message Control (16-bit)   */
+#define PCI_MSI_FLAGS_ENABLE        0x0001
+#define PCI_MSI_FLAGS_64BIT         0x0080
+#define PCI_MSI_MSG_LOWER_ADDRESS   4
+#define PCI_MSI_MSG_UPPER_ADDRESS   8
+#define PCI_MSI_MSG_DATA_32         8       /* 32-bit MSI: data @ +8      */
+#define PCI_MSI_MSG_DATA_64         12      /* 64-bit MSI: data @ +12     */
+
+/* PCI base+subclass of NVMe devices (PCI_CLASS_STORAGE_EXPRESS >> 8). */
+#define VMD_CLASS_NVME              0x0108
+
 /* IONVMeFamily integration keys (see VMD.cpp associateACPI). */
 #ifndef kACPIDevicePathKey
 #define kACPIDevicePathKey      "acpi-path"
@@ -200,7 +239,9 @@ private:
     uint8_t                 fBusnStart;     /* vmd->busn_start             */
     uint8_t                 fBusnEnd;       /* root bus window end         */
     uint8_t                 fFirstVec;      /* vmd->first_vec              */
+    uint32_t                fNextFreeVec;   /* vmd_next_irq() NVMe allocator*/
     uint32_t                fMsixCount;     /* vmd->msix_count             */
+    bool                    fDemuxMode;     /* remap demux vs stock bypass */
     unsigned long           fFeatures;      /* vmd->features               */
 
     uint64_t                fMembar2Offset; /* vmd_enable_domain()         */
@@ -236,6 +277,17 @@ private:
     bool setupMSIX(void);
     bool seedBridgeEntry(void);
     void postScanConfigure(void);
+    /* recursive per-device fix-up: EVERY child in the VMD domain gets
+     * ACPI + LTR + D0/decode + bridge windows + IOPCIConfigEntry/ranges[]
+     * + save-restore shadow + MSI wiring (any depth). */
+    void configureChildDevice(IOPCIConfigEntry *entry,
+                              IOPCIDevice *parentNub, int depth);
+    /* power-transition decode re-assert (see setDevicePowerState) */
+    void vmdReassertAll(void);
+    void vmdReassertSubtree(IOPCIConfigEntry *entry, int depth);
+    /* endpoint behind a root port: ASPM off on both link partners, DLLLA
+     * wait, vmdBridgeCheck(); NVMe-class also stabilize + Apple init probe */
+    void endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2, bool isNVMe);
     void appleNVMeInitDebug(IOPCIDevice *nub2);
     void vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2);
     bool stabilizeNVMeForCAP(IOPCIDevice *rp, IOPCIDevice *nub2);
@@ -248,6 +300,18 @@ private:
                                IOInterruptEventSource *src, int count);
 
 public:
+    /* Linux vmd_compose_msi_msg() + vmd_next_irq() port.  Public: called
+     * from VMDChildDevice's configureInterrupts()/registerInterrupt()
+     * overrides -- the two points where IOPCIFamily writes a host-composed
+     * MSI message into the child. */
+    void composeChildMSI(IOPCIDevice *nub);
+
+    /* The VMD device's own host-bus nub.  VMDChildDevice::registerInterrupt
+     * registers Apple's (target, handler, refCon) directly on THIS device's
+     * MSI-X vector fVmdVector -- the exact entry the VMD MSI remap fires
+     * (Linux: vmd_irq() -> generic_handle_irq() demux). */
+    IOPCIDevice * vmdDevice(void) const { return fPCIDev; }
+
     /* IOService */
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
@@ -258,7 +322,14 @@ public:
     virtual UInt8 firstBusNum(void) override;
     virtual UInt8 lastBusNum(void) override;
     virtual IOPCIAddressSpace getBridgeSpace(void) override;
-    virtual IOPCIDevice * createNub(OSDictionary *from) override;
+
+    /* every domain nub's power transition lands here (IOPCIDevice::
+     * setPowerState -> parent->setDevicePowerState; initializeNub() sets
+     * nub->parent = this driver) — re-assert the decode chain after the
+     * stock restore (checkLink can zero bridge windows on a DLLLA==0
+     * sample). */
+    virtual IOReturn setDevicePowerState(IOPCIDevice *device,
+                                         unsigned long whatToDo) override;
 
     /* Linux vmd_ops — ECAM config access (vmd_pci_read/vmd_pci_write). */
     virtual UInt32 configRead32(IOPCIAddressSpace space, UInt8 offset) override;
@@ -289,7 +360,6 @@ public:
                            UInt64 address,
                            UInt64 length);
     
-    VMDChildDevice *nvme;
     
 };
 
@@ -310,7 +380,25 @@ public:
     VMDDriver * pvmd;
     IOMemoryMap *rmmio {nullptr};
     volatile UInt32 *rmmioPtr {nullptr};
-    
+    /* VMD MSI-X vector index this child uses as its MSI destination id
+     * (0xFFFFFFFF = not yet allocated; see VMDDriver::composeChildMSI). */
+    uint32_t fVmdVector {0xFFFFFFFF};
+
+    /* IOPCIFamily writes a host-composed MSI message into the device at
+     * BOTH of these points (configureInterrupts allocates the vector,
+     * registerInterrupt programs the message).  Each override lets the
+     * stock call run, then rewrites the message to the VMD-composed one.
+     * registerInterrupt() also registers Apple's (target, handler, refCon)
+     * directly on the VMD device's MSI-X vector fVmdVector -- the entry the
+     * VMD remap fires -- so the completion interrupt reaches Apple. */
+    virtual IOReturn configureInterrupts(UInt32 interruptType,
+                                         UInt32 numRequired,
+                                         UInt32 numRequested,
+                                         IOOptionBits options) override;
+    virtual IOReturn registerInterrupt(int source, OSObject *target,
+                                       IOInterruptAction handler,
+                                       void *refCon = 0) override;
+
     virtual UInt32 configRead32( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite32( IOPCIAddressSpace space,
                                         UInt8 offset, UInt32 data ) override;
@@ -320,28 +408,38 @@ public:
     virtual UInt8 configRead8( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite8( IOPCIAddressSpace space,
                                         UInt8 offset, UInt8 data ) override;
+
+    /* One-argument convenience forms.  Declaring the (space, offset)
+     * overrides above NAME-HIDES every base-class overload with the same
+     * name, so unqualified configRead*(offset) calls inside VMDChildDevice
+     * members (reassertDecodeChain) stop compiling ("too few arguments,
+     * expected 2").  The base-class 1-arg VIRTUAL forms only exist under
+     * __IOPCIDEVICE_INTERNAL__; a third-party build sees only the inline
+     * IOByteCount forms, which route through extendedConfigRead* — NOT
+     * through pvmd's ECAM path.  Re-declare them here: same ECAM routing
+     * as the overrides above, using IOPCIDevice's public own-space member. */
+    UInt32 configRead32( UInt8 offset ) {
+        return pvmd ? pvmd->configRead32(space, offset) : 0xFFFFFFFF; }
+    void configWrite32( UInt8 offset, UInt32 data ) {
+        if (pvmd) pvmd->configWrite32(space, offset, data); }
+    UInt16 configRead16( UInt8 offset ) {
+        return pvmd ? pvmd->configRead16(space, offset) : 0xFFFF; }
+    void configWrite16( UInt8 offset, UInt16 data ) {
+        if (pvmd) pvmd->configWrite16(space, offset, data); }
+    UInt8 configRead8( UInt8 offset ) {
+        return pvmd ? pvmd->configRead8(space, offset) : 0xFF; }
+    void configWrite8( UInt8 offset, UInt8 data ) {
+        if (pvmd) pvmd->configWrite8(space, offset, data); }
     
     virtual IOWorkLoop * getWorkLoop(void) const override;
     virtual void free(void) override;
 
-    /* Decode-chain re-assert hooks.  Boot-3 evidence (pci1344,5411): the
-     * postScanConfigure() probe read a valid CAP (VMD-Dbg-APL-InitOK true),
-     * yet Apple still panicked on the same CAP read -- and RMA was recorded
-     * again although vmdBridgeCheck() had cleared it.  Prime clobberer found
-     * in IOPCIFamily 726: IOPCI2PCIBridge::checkLink() zeroes the root-port
-     * memory windows (kPCI2PCIMemoryRange/Prefetch, IOPCIBridge.cpp:4905)
-     * whenever LNKSTA.DLLLA reads 0 during a power/link transition, and
-     * nothing ever restores them.  These hooks re-assert the decode chain at
-     * nub start and at the exact call Apple's InitializePCI() uses to map
-     * BAR0 -- the last controllable point before the first MMIO read. */
-    virtual bool start(IOService *provider) override;
+
     virtual IOMemoryMap * mapDeviceMemoryWithRegister(
                             UInt8 reg, IOOptionBits options = 0) override;
     void reassertDecodeChain(const char *why);
 
-    /* Access to IOPCIDevice-protected state (configEntry / msiVectors).
-     * Defined as static members of VMDChildDevice because protected-member
-     * access rules require the derived static type. */
+
     static IOPCIConfigEntry * configEntryOf(IOPCIDevice *device);
     static IOInterruptVector * msiVectorsOf(IOPCIDevice *device);
 };

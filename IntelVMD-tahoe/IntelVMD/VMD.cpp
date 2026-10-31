@@ -535,6 +535,7 @@ bool VMDDriver::setupMSIX(void)
     uint8_t cap = 0;
     if (!fPCIDev->findPCICapability(kIOPCICapabilityIDMSIX, &cap) || !cap) {
         IOLog("IntelVMD: VMD device has no MSI-X capability\n");
+        fPCIDev->setProperty("VMD-MSIX-NoCap", true);
         return false;
     }
 
@@ -543,6 +544,13 @@ bool VMDDriver::setupMSIX(void)
 
     IOReturn ret = fPCIDev->configureInterrupts(kIOInterruptTypePCIMessagedX,
                                                 fMsixCount, fMsixCount);
+    // registry-only breadcrumbs on the VMD node: the MSI-X table is the
+    // backbone of child interrupt delivery — every setup stage observable.
+    fPCIDev->setProperty("VMD-MSIX-Cap", cap, 32);
+    fPCIDev->setProperty("VMD-MSIX-Count", fMsixCount, 32);
+    fPCIDev->setProperty("VMD-MSIX-FirstVec",
+                         (unsigned long long)fFirstVec, 32);
+    fPCIDev->setProperty("VMD-MSIX-Cfg-Stat", ret, 32);
     if (ret != kIOReturnSuccess)
         IOLog("IntelVMD: configureInterrupts(MSIX x%u) -> 0x%x\n",
               fMsixCount, ret);
@@ -881,11 +889,36 @@ bool VMDDriver::vmdProbe(IOService *provider)
     fBusnEnd = (uint8_t)busnEnd;
 
     if (fFeatures & VMD_FEAT_OFFSET_FIRST_VECTOR) fFirstVec = 1;
+    fNextFreeVec = fFirstVec + 1;   /* vmd_next_irq(): private NVMe vectors
+                                     * start above the shared "slow" vector */
 
-    if (!setupMSIX()) return false;
+    // ---- interrupt model (Linux vmd_probe(), linuxvmd.c:991) ------------
+    //
+    //   demux : VMCONFIG.MSI_REMAP clear (remap ACTIVE) — child MSIs are
+    //           multiplexed into the VMD's own MSI-X table and demuxed by
+    //           this driver (Linux: vmd_alloc_irqs + vmd_create_irq_domain).
+    //   bypass: VMCONFIG.MSI_REMAP set   (remap BYPASSED) — child MSIs
+    //           egress the VMD untranslated and the STOCK IOPCIFamily
+    //           messaged-interrupt controller owns them end to end (Linux
+    //           creates no irq_domain at all for CAN_BYPASS devices).
+    //
+    // The configurator scan builds stock IOPCIDevice nubs (OSTypeAlloc in
+    // IOPCIConfigurator.cpp — createNub() is never called on this path), so
+    // the VMDChildDevice demux hooks cannot run: bypass is the only model
+    // that delivers interrupts through 100% stock paths.  Default follows
+    // the Linux feature table; force per-boot with an OSBoolean/OSData
+    // property on the VMD device: "VMD-Force-Bypass" / "VMD-Force-Demux".
+    fDemuxMode = !(fFeatures & VMD_FEAT_CAN_BYPASS_MSI_REMAP);
+   // if (vmdBoolProperty(fPCIDev, "VMD-Force-Demux", false))
+        fDemuxMode = true;
+   // if (vmdBoolProperty(fPCIDev, "VMD-Force-Bypass", false))
+        //fDemuxMode = false;
+    fPCIDev->setProperty("VMD-MSI-Model", fDemuxMode ? "demux" : "bypass");
 
-    // force the demux model: child MSIs land in the VMD MSI-X table
-    setMSIRemapping(true);
+    if (fDemuxMode) {
+        if (!setupMSIX()) return false;
+    }
+    setMSIRemapping(fDemuxMode);
 
     // pci_create_root_bus(..., vmd->busn_start, ...): the "bridge space" is
     // the root port at bus 0 / device 0 / function 0 of the VMD domain.
@@ -973,22 +1006,24 @@ bool VMDDriver::start(IOService *provider)
         IOLog("IntelVMD: probe failed\n");
         return false;
     }
+    fPCIDev->setProperty("VMD-Stage-Probe", true);
     if (!seedBridgeEntry()) {
         IOLog("IntelVMD: cannot seed the bridge config entry\n");
         return false;
     }
+    fPCIDev->setProperty("VMD-Stage-Seed", true);
 
     bool ok = IOPCI2PCIBridge::start(provider);
     if (!ok) {
         IOLog("IntelVMD: IOPCI2PCIBridge::start failed\n");
         return false;
     }
-    
+    fPCIDev->setProperty("VMD-Stage-FamilyStart", true);
 
     fPCIDev->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
     fPCIDev->setPowerState(kIOPCIDeviceOnState, this);
     IOSleep(10);
-    //fPCIDev->setProperty(kIOPCIIgnoreLinkStatusKey,true);
+    
     
     // pci_scan_child_bus()
     configOpParams cp;
@@ -996,9 +1031,22 @@ bool VMDDriver::start(IOService *provider)
     cp.op     = kConfigOpScan;
     cp.result = NULL;
     configOp(&cp);
-    
+
+    // scan census: how many entries the configurator hung off the root
+    // complex.  0 means the scan found nothing — check the ECAM accessors.
+    uint32_t scanKids = 0;
+    for (IOPCIConfigEntry *c = fBridgeEntry->child; c; c = c->peer)
+        scanKids++;
+    fPCIDev->setProperty("VMD-Stage-Scan-Children", scanKids, 32);
     
     postScanConfigure();
+    fPCIDev->setProperty("VMD-Stage-PostScan-Done", true);
+
+    // last-moment decode re-assert before driver matching begins: anything
+    // between postScanConfigure() and matching (family bridge init,
+    // checkLink on power paths) may have zeroed the windows again.
+    vmdReassertAll();
+    fPCIDev->setProperty("VMD-Stage-PreRegister-Reassert", true);
 
     registerService();
 
@@ -1162,95 +1210,638 @@ bool VMDDriver::seedBridgeEntry(void)
     return true;
 }
 
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * postScanConfigure — per-device work after pci_scan_child_bus(), applied
+ * to EVERY device in the VMD domain (root ports, the mirrored AHCI,
+ * endpoints — any depth), not just one bridge + NVMe pair:
+ *
+ *   1. vmd_acpi_find_companion() for every device, so drivers (Apple's
+ *      IONVMeFamily included) find acpiRootDevice.
+ *   2. vmd_pm_enable_quirk() — driver-default LTR values, every device.
+ *   3. D0 + command.MEM/BUS-MASTER on every device.
+ *   4. EVERY type-1 header gets its memory / prefetchable windows
+ *      reprogrammed over ALL downstream BARs (any depth) — resetDomain()
+ *      closed them all, so fixing one bridge only left every other child
+ *      master-aborting.
+ *   5. IOPCIConfigEntry sync — the configurator's shadow of every device.
+ *      entry->ranges[] (BARs, kIOPCIRangeBridgeMemory/PFMemory) are the
+ *      source of truth for the configurator's apply/restore passes
+ *      (sleep-wake, kConfigOpRealloc) and IOPCIDevice::restoreDeviceState()
+ *      writes back configSave.savedConfig[].  Writing the fixed windows to
+ *      hardware only — without refreshing the entry — made the next
+ *      restore pass write the STALE windows back, forcing every consumer
+ *      to remap.  Here the entry and the shadow are synced to the FIXED
+ *      hardware state, so restore passes write the fixed values back and
+ *      nothing needs to remap.
+ *   6. child MSI wiring onto the VMD's own MSI-X vectors (irq demux) for
+ *      every device.
+ *   7. every endpoint behind a root port: ASPM off on both link partners
+ *      + DLLLA wait (endpointLinkPrep); NVMe-class endpoints additionally
+ *      get vmdBridgeCheck() + stabilizeNVMeForCAP() + appleNVMeInitDebug().
+ *
+ * All diagnostics are registry properties: VMD-Cfg-* on each device's own
+ * nub, VMD-Dbg-* on the NVMe endpoint.  No IOLog from this pass.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-void VMDDriver::postScanConfigure(void)
+/* Window helpers — definitions live with vmdBridgeCheck below. */
+static bool vmdWindowCovers(uint32_t reg32, uint64_t lo, uint64_t hi);
+static void vmdProgramWindow(IOPCIDevice *rp, uint8_t offset,
+                             uint64_t lo, uint64_t hi);
+
+/* Device-property boolean: OSBoolean or 1-byte OSData (config.plist
+ * DeviceProperties inject booleans as OSData). */
+static bool vmdBoolProperty(IOService *dev, const char *key, bool dflt)
 {
-    if (!fBridgeEntry) return;
+    OSObject *obj = dev ? dev->getProperty(key) : NULL;
+    if (OSBoolean *b = OSDynamicCast(OSBoolean, obj)) return b->getValue();
+    if (OSData *d = OSDynamicCast(OSData, obj))
+        if (d->getLength() >= 1)
+            return (((const uint8_t *)d->getBytesNoCopy())[0] != 0);
+    return dflt;
+}
 
-    resetDomain();
-    IOSleep(100);
-    
-    for (IOPCIConfigEntry *child = fBridgeEntry->child; child; child = child->peer) {
-        IOPCIDevice *nub = OSDynamicCast(IOPCIDevice, child->dtNub);
+static IOPCIDevice * vmdEntryNub(IOPCIConfigEntry *entry)
+{
+    return entry ? OSDynamicCast(IOPCIDevice, entry->dtNub) : NULL;
+}
+
+/* vmdBarLength — length of one BAR from the nub's "IODeviceMemory"
+ * descriptors (built from assigned-addresses at scan time).  0 = unknown. */
+static uint64_t vmdBarLength(IOPCIDevice *nub, uint32_t regOffset)
+{
+    OSArray *deviceMemory = nub->getDeviceMemory();
+    for (uint32_t idx = 0; deviceMemory; idx++) {
+        IOMemoryDescriptor *mem =
+            (IOMemoryDescriptor *)deviceMemory->getObject(idx);
+        if (!mem) break;
+        IOPCIAddressSpace tag;
+        tag.bits = mem->getTag();
+        if (tag.s.registerNum == regOffset) return mem->getLength();
+    }
+    return 0;
+}
+
+/* How many BAR slots this header type exposes (type-1 bridges: 2 — reading
+ * BAR2+ on a type-1 header returns the bridge window registers instead). */
+static uint32_t vmdMaxBars(IOPCIDevice *nub)
+{
+    uint8_t hdr = nub->configRead8(kIOPCIConfigHeaderType) & 0x7f;
+    if (hdr == kPCIHeaderType0) return 6;
+    if (hdr == kPCIHeaderType1) return 2;
+    return 0;
+}
+
+/* vmdAddDeviceBars — fold one device's live memory BARs into the window
+ * spans.  Config space wins over the scan descriptors (same rule as
+ * reassertDecodeChain); sizes come from the descriptors when available. */
+static void vmdAddDeviceBars(IOPCIDevice *nub, IOPCIConfigEntry *entry,
+                             uint64_t *memMin, uint64_t *memMax, bool *haveMem,
+                             uint64_t *pfMin, uint64_t *pfMax, bool *havePF)
+{
+    uint32_t maxBars = vmdMaxBars(nub);
+    for (uint32_t barIdx = 0; barIdx < maxBars; ) {
+        uint32_t lo = nub->configRead32(kIOPCIConfigBaseAddress0 + 4 * barIdx);
+        if (lo == 0xFFFFFFFFU) break;
+        if (lo & 0x1) { barIdx++; continue; }          // I/O BAR — n/a
+        bool is64 = (((lo >> 1) & 0x3) == 0x2);
+        uint32_t hi = is64
+            ? nub->configRead32(kIOPCIConfigBaseAddress0 + 4 * barIdx + 4) : 0;
+        uint64_t base = (((uint64_t)hi << 32) | lo) & ~0xFULL;
+        if (base) {
+            uint64_t len = vmdBarLength(nub, kIOPCIConfigBaseAddress0
+                                              + 4 * barIdx);
+            if (!len && entry && entry->ranges[kIOPCIRangeBAR0 + barIdx])
+                len = entry->ranges[kIOPCIRangeBAR0 + barIdx]->size;
+            uint64_t end = base + ((len) ? (len - 1) : 0xFFFFFULL);
+            if (lo & 0x8) {                            // prefetchable
+                *pfMin = (base < *pfMin) ? base : *pfMin;
+                *pfMax = (end  > *pfMax) ? end  : *pfMax;
+                *havePF = true;
+            } else {
+                *memMin = (base < *memMin) ? base : *memMin;
+                *memMax = (end  > *memMax) ? end  : *memMax;
+                *haveMem = true;
+            }
+        }
+        barIdx += is64 ? 2 : 1;
+    }
+}
+
+/* vmdCollectSubtreeBars — all BARs in a bridge's subtree, any depth. */
+static void vmdCollectSubtreeBars(IOPCIConfigEntry *bridge,
+                                  uint64_t *memMin, uint64_t *memMax,
+                                  bool *haveMem,
+                                  uint64_t *pfMin, uint64_t *pfMax,
+                                  bool *havePF, int depth)
+{
+    if (!bridge || depth > 4) return;
+    for (IOPCIConfigEntry *child = bridge->child; child; child = child->peer) {
+        IOPCIDevice *nub = vmdEntryNub(child);
         if (!nub) continue;
-        if (nub->configRead16(kIOPCIConfigCommand) == 0) continue;
-        
-        associateACPI(child, NULL);
+        vmdAddDeviceBars(nub, child, memMin, memMax, haveMem,
+                         pfMin, pfMax, havePF);
+        if (child->isBridge)
+            vmdCollectSubtreeBars(child, memMin, memMax, haveMem,
+                                  pfMin, pfMax, havePF, depth + 1);
+    }
+}
 
-        enableLTRQuirk(nub);
+/* vmdSyncWindowRange — keep ONE bridge-window IOPCIRange of the
+ * configurator entry equal to the programmed hardware window.  ranges[]
+ * are what the configurator's apply/restore passes write back; leaving
+ * them stale is what made later restores undo the window fix. */
+static void vmdSyncWindowRange(IOPCIConfigEntry *bridge, IOPCIDevice *nub,
+                               uint32_t rangeIndex,
+                               uint64_t wLo, uint64_t wHiEx)
+{
+    IOPCIRange *range = bridge->ranges[rangeIndex];
+    if (!range) {
+        // configurator never created this window range — flag it so ioreg
+        // shows why the entry could not be synced
+        if (nub) nub->setProperty("VMD-Cfg-Range-Missing", rangeIndex, 32);
+        return;
+    }
+    if (wHiEx <= wLo) return;
 
-        wireChildMSI(nub);
-        
-        
-        if (child->isBridge) {
-            
-            IOPCIDevice *nub2 =
-                OSDynamicCast(IOPCIDevice, nub->getChildEntry(gIODTPlane));
-            if (!nub2) continue;
-            IOPCIConfigEntry *child2 = VMDChildDevice::configEntryOf(nub2);
-            if (!child2) continue;
+    uint64_t span = wHiEx - wLo;
+    range->start        = wLo;
+    range->end          = wHiEx;
+    range->size         = span;
+    range->totalSize    = span;
+    range->proposedSize = span;
+}
 
-            if (nub2->configRead16(kIOPCIConfigCommand) == 0) continue;
-            
-            vmdBridgeCheck(nub, nub2);
+/* vmdSyncConfigEntry — sync one device's IOPCIConfigEntry + IOPCIDevice
+ * save/restore shadow to the live (fixed) hardware state:
+ *   - BAR ranges: entry->ranges[BARn].start := live BAR base (the BARs are
+ *     not touched by resetDomain(), but keep the entry honest if anything
+ *     clobbered them),
+ *   - configSave.savedConfig[]: what IOPCIDevice::restoreDeviceState()
+ *     writes back on the next D3 -> D0 / sleep-wake pass.
+ */
+static void vmdSyncConfigEntry(IOPCIDevice *nub, IOPCIConfigEntry *entry,
+                               bool isBridge)
+{
+    if (!nub || !entry) return;
 
-            associateACPI(child2, nub);
-
-            enableLTRQuirk(nub2);
-            wireChildMSI(nub2);
-
-            nvme=(VMDChildDevice*)nub2;
-            
-            enum {
-                ASPM_L0sAndL1EntryDisabled = 0,
-                ASPM_L0sEntryEnabled       = 1,
-                ASPM_L1EntryEnabled        = 2,
-                ASPM_L0sAndL1EntryEnabled  = 3,
-                ASPM_Mask = ASPM_L0sAndL1EntryEnabled
-            };
-            
-            IOPCIDevice *pci = static_cast<IOPCIDevice *>(nub2);
-            if (!pci) return;
-
-            uint32_t aspm = 0;
-            auto prop = pci->getProperty("pci-aspm-default");
-            if (prop) {
-                auto num = OSDynamicCast(OSNumber, prop);
-                if (num != nullptr) {
-                    aspm = num->unsigned32BitValue();
-                }
+    uint32_t synced  = 0;
+    uint32_t maxBars = vmdMaxBars(nub);
+    for (uint32_t barIdx = 0; barIdx < maxBars; ) {
+        uint32_t lo = nub->configRead32(kIOPCIConfigBaseAddress0 + 4 * barIdx);
+        if (lo == 0xFFFFFFFFU) break;
+        bool is64 = (((lo >> 1) & 0x3) == 0x2);
+        if (!(lo & 0x1)) {
+            uint32_t hi = is64
+                ? nub->configRead32(kIOPCIConfigBaseAddress0 + 4 * barIdx + 4)
+                : 0;
+            uint64_t base = (((uint64_t)hi << 32) | lo) & ~0xFULL;
+            IOPCIRange *range = entry->ranges[kIOPCIRangeBAR0 + barIdx];
+            if (range && base && range->start != base) {
+                range->start = base;
+                range->end   = base + range->size;
+                synced++;
             }
+        }
+        barIdx += is64 ? 2 : 1;
+    }
 
+    // Save/restore shadow — bridge headers keep 32 dwords, endpoints 16
+    // (the same split the family uses for save/restoreDeviceState()).
+    IOPCIConfigShadow *shadow = configShadow(nub);
+    if (shadow) {
+        uint32_t regs = isBridge ? kIOPCIConfigBridgeShadowRegs
+                                 : kIOPCIConfigEPShadowRegs;
+        for (uint32_t i = 0; i < regs; i++)
+            shadow->configSave.savedConfig[i] = nub->configRead32(i * 4);
+    }
 
-            if ((aspm & ASPM_Mask) == ASPM_L1EntryEnabled) {}
-            else
-            {
-                
-                UInt8 offset = 0;
-                if (!pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offset)) {
-                    return;
-                }
-                
-                offset += 0x10;
-                
-                IOPCIAddressSpace space = pci->space;
-                space.es.registerNumExtended = 0;
-                
-                auto linkControl = pci->configRead16(space, offset);
-                pci->configWrite16(space, offset, (linkControl & ~ASPM_Mask) | ASPM_L1EntryEnabled);
-                auto newLinkControl = pci->configRead16(space, offset);
-                
-                pci->setProperty("pci-aspm-custom", newLinkControl, 32);
-            }
+    nub->setProperty("VMD-Cfg-Ranges-Synced", synced, 32);
+    nub->setProperty("VMD-Cfg-Shadow", shadow != NULL);
+}
 
-            appleNVMeInitDebug(nub2);
-            
-            IOLog("IntelVMD: endpoint %02x:%02x.%x configured\n",
-                  child2->space.s.busNum, child2->space.s.deviceNum,
-                  child2->space.s.functionNum);
+/* vmdPowerUpDecode — D0 + command.MEM/BUS-MASTER for ONE device.  MEM
+ * decode must be on for MMIO to answer at all, bus master for MSI/DMA. */
+static void vmdPowerUpDecode(IOPCIDevice *nub)
+{
+    UInt8 pm = 0;
+    if (nub->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) {
+        UInt16 pmcsr = nub->configRead16(pm + 4);
+        if (pmcsr & 0x3) {                         // D1/D2/D3 -> D0
+            nub->configWrite16(pm + 4, pmcsr & ~0x0003);
+            IOSleep(10);
+            nub->setProperty("VMD-Cfg-D0-Fixed", true);
         }
     }
 
+    UInt16 cmd = nub->configRead16(kIOPCIConfigCommand);
+    nub->setProperty("VMD-Cfg-CMD-Pre", cmd, 16);
+    if ((cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
+                != (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) {
+        nub->configWrite16(kIOPCIConfigCommand,
+                           cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+        IOSleep(2);
+        nub->setProperty("VMD-Cfg-CMD-Fixed", true);
+    }
+}
+
+/* vmdFixBridgeWindows — reprogram ONE bridge's memory / prefetchable
+ * windows over ALL downstream BARs (any depth), sync the configurator
+ * entry's window ranges to the programmed values, and pin the bridge I/O
+ * window to the DISABLED encoding (a VMD domain has no I/O space; Linux
+ * receipts in the body comment). */
+static void vmdFixBridgeWindows(IOPCIConfigEntry *bridge,
+                                IOPCIDevice *bridgeNub)
+{
+    uint64_t memMin = ~0ULL, memMax = 0, pfMin = ~0ULL, pfMax = 0;
+    bool haveMem = false, havePF = false;
+
+    vmdCollectSubtreeBars(bridge, &memMin, &memMax, &haveMem,
+                          &pfMin, &pfMax, &havePF, 0);
+
+    if (haveMem) {
+        bridgeNub->setProperty("VMD-Cfg-Sub-MEM-Base",
+                               (unsigned long long)memMin, 64);
+        bridgeNub->setProperty("VMD-Cfg-Sub-MEM-End",
+                               (unsigned long long)memMax, 64);
+        uint32_t memReg = bridgeNub->configRead32(PCI_MEMORY_BASE);
+        bridgeNub->setProperty("VMD-Cfg-Bridge-MEM-REG", memReg, 32);
+        if (!vmdWindowCovers(memReg, memMin, memMax)) {
+            vmdProgramWindow(bridgeNub, PCI_MEMORY_BASE, memMin, memMax);
+            memReg = bridgeNub->configRead32(PCI_MEMORY_BASE);
+            // "Fixed" only when the window really covers now — BARs above
+            // 4 GB cannot be represented in the 32-bit window registers
+            bridgeNub->setProperty("VMD-Cfg-Bridge-MEM-Fixed",
+                                   vmdWindowCovers(memReg, memMin, memMax));
+            if (!vmdWindowCovers(memReg, memMin, memMax))
+                bridgeNub->setProperty("VMD-Cfg-Bridge-MEM-CannotFix", true);
+        }
+        bridgeNub->setProperty("VMD-Cfg-Bridge-MEM-Win-OK",
+                               vmdWindowCovers(memReg, memMin, memMax));
+        uint64_t wLo = ((uint64_t)(memReg & 0xFFF0)) << 16;
+        uint64_t wHi = ((((uint64_t)(memReg >> 16)) & 0xFFF0) << 16) | 0xFFFFF;
+        if (wLo <= wHi)
+            vmdSyncWindowRange(bridge, bridgeNub,
+                               kIOPCIRangeBridgeMemory, wLo, wHi + 1);
+    }
+
+    if (havePF) {
+        bridgeNub->setProperty("VMD-Cfg-Sub-PF-Base",
+                               (unsigned long long)pfMin, 64);
+        bridgeNub->setProperty("VMD-Cfg-Sub-PF-End",
+                               (unsigned long long)pfMax, 64);
+        uint32_t pfReg = bridgeNub->configRead32(PCI_PREF_MEMORY_BASE);
+        bridgeNub->setProperty("VMD-Cfg-Bridge-PF-REG", pfReg, 32);
+        if (!vmdWindowCovers(pfReg, pfMin, pfMax)) {
+            vmdProgramWindow(bridgeNub, PCI_PREF_MEMORY_BASE, pfMin, pfMax);
+            // 64-bit pref window upper halves — VMD windows live below 4 GB
+            bridgeNub->configWrite32(PCI_PREF_BASE_UPPER32, 0);
+            bridgeNub->configWrite32(PCI_PREF_LIMIT_UPPER32, 0);
+            pfReg = bridgeNub->configRead32(PCI_PREF_MEMORY_BASE);
+            // "Fixed" only when the window really covers now — PF BARs
+            // above 4 GB cannot be routed by this 32-bit window fix
+            bridgeNub->setProperty("VMD-Cfg-Bridge-PF-Fixed",
+                                   vmdWindowCovers(pfReg, pfMin, pfMax));
+            if (!vmdWindowCovers(pfReg, pfMin, pfMax))
+                bridgeNub->setProperty("VMD-Cfg-Bridge-PF-CannotFix", true);
+        }
+        bridgeNub->setProperty("VMD-Cfg-Bridge-PF-Win-OK",
+                               vmdWindowCovers(pfReg, pfMin, pfMax));
+        uint64_t wLo = ((uint64_t)(pfReg & 0xFFF0)) << 16;
+        uint64_t wHi = ((((uint64_t)(pfReg >> 16)) & 0xFFF0) << 16) | 0xFFFFF;
+        if (wLo <= wHi)
+            vmdSyncWindowRange(bridge, bridgeNub,
+                               kIOPCIRangeBridgePFMemory, wLo, wHi + 1);
+    }
+
+    // ---- I/O window: explicitly DISABLED, exactly like Linux ---------------
+    //
+    // A VMD domain has NO I/O port space at all:
+    //   - linuxvmd.c vmd_enable_domain():1005 adds exactly three domain
+    //     resources — IORESOURCE_BUS + MEMBAR1 + MEMBAR2 (both
+    //     IORESOURCE_MEM).  Zero IORESOURCE_IO in the whole driver, so the
+    //     PCI core can never assign a bridge I/O window ("BAR 13: no space
+    //     for [io size 0x1000]" / "failed to assign"), and
+    //     pci_setup_bridge_io() ends by writing the disabled encoding
+    //     (base 0xF0 > limit 0x00, upper16 = 0) without printing anything.
+    //   - The dmesg line "bridge window [io 0x0000-0x0fff]" is the
+    //     READ-BACK of an unassigned window: pci_read_bridge_io() turns
+    //     base=0/limit=0 into the range 0x0000-0x0fff and logs it during
+    //     enumeration.  It is not an enabled window.
+    //   - VMD silicon has no I/O aperture either — CFGBAR/MEMBAR1/MEMBAR2
+    //     only.  Apple's IONVMeFamily does zero I/O-port accesses (BAR0
+    //     MMIO + IODMACommand/PRP DMA; the decompile has no ioMap/ioRead/
+    //     ioWrite references), and the NVMe endpoint itself declares no
+    //     I/O BAR.  DMA never traverses I/O port space: it needs the
+    //     bridge MEM window (fixed above) + COMMAND.BUS-MASTER (set in
+    //     vmdPowerUpDecode).
+    //
+    // resetDomain() already wrote the Linux disabled encoding over the raw
+    // ECAM, but the configurator entry's kIOPCIRangeBridgeIO was sized by
+    // the scan from the PRE-reset BIOS values and nothing updated it — the
+    // same stale-IOPCIConfigEntry class of bug as the mem windows.  Re-
+    // assert the disabled encoding through the nub config path and empty
+    // the entry range so no restore/reassign pass can resurrect a window
+    // that points into the void.
+    uint32_t ioPre = bridgeNub->configRead32(PCI_IO_BASE);
+    bridgeNub->setProperty("VMD-Cfg-Bridge-IO-REG", ioPre & 0xFFFF, 32);
+    bridgeNub->configWrite32(PCI_IO_BASE_UPPER16, 0x0000ffff);  // temp disable
+    bridgeNub->configWrite16(PCI_IO_BASE, 0x00f0);              // base > limit
+    bridgeNub->configWrite32(PCI_IO_BASE_UPPER16, 0);           // upper16 = 0
+    bridgeNub->setProperty("VMD-Cfg-Bridge-IO-DIS", true);
+    bridgeNub->setProperty("VMD-Cfg-Bridge-IO-Post",
+                           bridgeNub->configRead32(PCI_IO_BASE) & 0xFFFF, 32);
+
+    IOPCIRange *ioRange = bridge->ranges[kIOPCIRangeBridgeIO];
+    if (ioRange) {
+        ioRange->start        = 0;
+        ioRange->end          = 0;
+        ioRange->size         = 0;
+        ioRange->totalSize    = 0;
+        ioRange->extendSize   = 0;
+        ioRange->proposedSize = 0;
+        bridgeNub->setProperty("VMD-Cfg-Bridge-IO-Range-Cleared", true);
+    } else {
+        bridgeNub->setProperty("VMD-Cfg-Bridge-IO-Range-Missing", true);
+    }
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * postScanConfigure driver:
+ *
+ *   - resetDomain() runs ONCE over the whole ECAM (it only closes bridge
+ *     windows; a real secondary-bus reset would zero the endpoints' BARs
+ *     and command register — the two-argument IOPCIDevice::reset() is not
+ *     exported by IOPCIFamily, so windows-only is what we can safely do),
+ *   - then EVERY child of the VMD root complex gets configureChildDevice():
+ *     the mirrored AHCI (e.g. 8086:a0d3 at dev 0x17), the fixed root port
+ *     (8086:09ab), the active root port (8086:a0bc) and the NVMe endpoint
+ *     behind it.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::postScanConfigure(void)
+{
+    if (!fBridgeEntry) {
+        // silent-exit killer: without the bridge entry the whole per-device
+        // fix-up pass (windows, MSI wiring, CAP probe) would never run and
+        // nothing in the registry would ever say why.
+        fPCIDev->setProperty("VMD-Stage-PostScan-Fail", "no-bridge-entry");
+        return;
+    }
+    fPCIDev->setProperty("VMD-Stage-PostScan-Start", true);
+
+    bool anyBridge = false;
+    for (IOPCIConfigEntry *child = fBridgeEntry->child; child;
+         child = child->peer) {
+        if (child->isBridge) { anyBridge = true; break; }
+    }
+    if (anyBridge) {
+        resetDomain();
+        IOSleep(100);
+    }
+
+    uint32_t configured = 0;
+    for (IOPCIConfigEntry *child = fBridgeEntry->child; child;
+         child = child->peer) {
+        configureChildDevice(child, NULL, 0);
+        configured++;
+    }
+    fPCIDev->setProperty("VMD-Stage-PostScan-Children", configured, 32);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * setDevicePowerState — IOPCIBridge virtual.  initializeNub() sets
+ * nub->parent = the bridge that probed it — for EVERY device in the VMD
+ * domain that is THIS driver — so each domain nub's power transition
+ * (IOPCIDevice::setPowerState -> parent->setDevicePowerState) lands here,
+ * including the NVMe endpoint's D0 right before Apple's InitializePCI()
+ * reads CAP.
+ *
+ * The stock path can clobber the decode chain: IOPCI2PCIBridge power
+ * management runs checkLink(), which zeroes the bridge windows when it
+ * samples LNKSTA.DLLLA == 0 (IOPCIBridge.cpp:4905-4908 — the Boot-3
+ * "clobbered between postScanConfigure() and Apple's first MMIO read"
+ * evidence).  Re-assert the whole decode chain AFTER the stock call, i.e.
+ * after any such clobber and before Apple's driver code runs — this is the
+ * replacement for the dead VMDChildDevice::start()/
+ * mapDeviceMemoryWithRegister() hooks (stock nubs, no overrides).
+ *
+ * Registry-only breadcrumbs (no IOLog), on the waking nub:
+ *   VMD-PM-Hook       the whatToDo argument of this call
+ *   VMD-PM-Reassert   depth of this nub in the re-assert walk
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+IOReturn VMDDriver::setDevicePowerState(IOPCIDevice *device,
+                                        unsigned long whatToDo)
+{
+    IOReturn ret = IOPCI2PCIBridge::setDevicePowerState(device, whatToDo);
+
+    // skip the sleep-save call (kIOPCIConfigShadowPermanent): re-asserting
+    // decode bits on a device being powered down would undo the save path.
+    if (device && (device != fPCIDev) && fBridgeEntry
+        && !(whatToDo & kIOPCIConfigShadowPermanent)) {
+        device->setProperty("VMD-PM-Hook", (unsigned long long)whatToDo, 32);
+        vmdReassertAll();
+    }
+    return ret;
+}
+
+/* vmdReassertAll — power-management-safe re-run of the decode fix-up:
+ * D0 + command decode on every nub, bridge windows over all downstream
+ * BARs, entry ranges + save/restore shadow re-sync.  Idempotent; the tree
+ * is tiny (root port + endpoint + mirrored functions), so this is a
+ * handful of config writes.  No sleeps, no MSI work (interrupts are owned
+ * by the model chosen in vmdProbe). */
+void VMDDriver::vmdReassertAll(void)
+{
+    for (IOPCIConfigEntry *child = fBridgeEntry->child; child;
+         child = child->peer)
+        vmdReassertSubtree(child, 0);
+}
+
+void VMDDriver::vmdReassertSubtree(IOPCIConfigEntry *entry, int depth)
+{
+    if (!entry || depth > 4) return;
+    IOPCIDevice *nub = vmdEntryNub(entry);
+    if (!nub) return;
+
+    UInt16 vid = nub->configRead16(kIOPCIConfigVendorID);
+    if (vid == 0xFFFF) return;
+
+    vmdPowerUpDecode(nub);
+
+    bool isBridge = ((nub->configRead8(kIOPCIConfigHeaderType) & 0x7f)
+                     == kPCIHeaderType1);
+    if (isBridge) {
+        vmdFixBridgeWindows(entry, nub);
+        vmdSyncConfigEntry(nub, entry, true);
+    } else {
+        vmdSyncConfigEntry(nub, entry, false);
+    }
+    nub->setProperty("VMD-PM-Reassert", depth, 32);
+
+    for (IOPCIConfigEntry *c = entry->child; c; c = c->peer)
+        vmdReassertSubtree(c, depth + 1);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * configureChildDevice — the recursive per-device fix-up.  Every device
+ * keeps its own IOPCIConfigEntry; all of them are brought up and synced:
+ *
+ *   1. ACPI companion (endpoints inherit the root port's association),
+ *   2. LTR quirk,
+ *   3. D0 + command.MEM/BUS-MASTER,
+ *   4. bridges: windows over ALL downstream BARs + entry range sync,
+ *   5. IOPCIConfigEntry ranges + save/restore shadow := fixed hardware,
+ *   6. child MSI wiring onto the VMD's own MSI-X vectors,
+ *   7. endpoints behind a root port: link prep (ASPM off, DLLLA wait);
+ *      NVMe-class endpoints: + vmdBridgeCheck/stabilize/apple probe,
+ *   8. recurse into the bridge's children.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
+                                     IOPCIDevice *parentNub, int depth)
+{
+    if (!entry || depth > 4) return;
+    IOPCIDevice *nub = vmdEntryNub(entry);
+    if (!nub) {
+        // the entry exists but no nub was built for it (scan/creation
+        // mismatch) — record it on the parent so the gap is visible.
+        if (parentNub) {
+            parentNub->setProperty("VMD-Cfg-NoNub", true);
+            parentNub->setProperty("VMD-Cfg-NoNub-Space",
+                                   (unsigned long long)entry->space.bits, 32);
+        }
+        return;
+    }
+    nub->setProperty("VMD-Cfg-Visited", depth, 32);
+
+    // Dead in ECAM — skip the whole subtree.
+    UInt16 vid = nub->configRead16(kIOPCIConfigVendorID);
+    if (vid == 0xFFFF) {
+        nub->setProperty("VMD-Cfg-Dead", true);
+        return;
+    }
+
+    // 1. ACPI companion (vmd_acpi_find_companion)
+    associateACPI(entry, parentNub);
+
+    // 2. vmd_pm_enable_quirk()
+    enableLTRQuirk(nub);
+
+    // 3. D0 + command decode
+    vmdPowerUpDecode(nub);
+
+    bool isBridge = ((nub->configRead8(kIOPCIConfigHeaderType) & 0x7f)
+                     == kPCIHeaderType1);
+
+    // 4. bridge windows over ALL downstream BARs
+    if (isBridge) vmdFixBridgeWindows(entry, nub);
+
+    // 5. IOPCIConfigEntry + save/restore shadow := fixed hardware
+    vmdSyncConfigEntry(nub, entry, isBridge);
+
+    // 6. child MSI wiring onto the VMD's own MSI-X vectors (irq demux)
+    wireChildMSI(nub);
+
+    // 7. endpoint behind a root port: link prep; NVMe: + controller probe
+    if (!isBridge && parentNub) {
+        uint32_t cls = nub->configRead32(kIOPCIConfigRevisionID) >> 16;
+        endpointLinkPrep(parentNub, nub, cls == VMD_CLASS_NVME);
+    }
+
+    // 8. recurse — every child of this bridge gets the same treatment
+    for (IOPCIConfigEntry *child = entry->child; child; child = child->peer)
+        configureChildDevice(child, nub, depth + 1);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * endpointLinkPrep — per-endpoint work that needs the root port nub:
+ *
+ *   - ASPM off on BOTH link partners (direct LNKCTL writes + the
+ *     "pci-aspm-default" OSData for later re-probes),
+ *   - DLLLA wait so the link is up before Apple's first MMIO read,
+ *   - vmdBridgeCheck() — VMD-device -> root-port -> endpoint decode chain
+ *     diagnostics + fixes (idempotent after the generic steps above),
+ *   - NVMe-class endpoints only: stabilizeNVMeForCAP() (read-only CAP poll
+ *     with decode-toggle / retrain kicks) and appleNVMeInitDebug() (Apple's
+ *     InitializePCI()/SetNVMeProperties() probe, registry-only).
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2,
+                                 bool isNVMe)
+{
+    if (!rp || !nub2) return;
+
+    // --- ASPM off on the NVMe link (both link partners) ----------------------
+    //
+    // The only ASPM key IOPCIFamily consumes is kIOPCIExpressASPMDefaultKey
+    // = "pci-aspm-default", resolved in IOPCIBridge::probeBusGated() during
+    // the scan pass that creates these nubs — i.e. BEFORE postScanConfigure()
+    // runs — and ONLY as a 4-byte OSData.  Encoding = LNKCTL.ASPMControl:
+    // 0 = off, 1 = L0s, 2 = L1, 3 = L0s+L1.  What flips the link state right
+    // now is the DIRECT LNKCTL config write on BOTH ends below (the same
+    // runtime mechanism NVMeFix uses; we force 0 for bring-up).  The OSData
+    // property is still injected so later re-probes (rescan / hot-plug /
+    // wake re-probe) resolve ASPM = 0 instead of the hardware default.
+    uint32_t aspmOff = 0;               /* kIOPCILinkControlASPMBitsDisabled */
+    OSData *aspmProp = OSData::withBytes(&aspmOff, sizeof(aspmOff));
+    if (aspmProp) {
+        nub2->setProperty(kIOPCIExpressASPMDefaultKey, aspmProp);
+        aspmProp->release();
+    }
+    nub2->setProperty("VMD-Dbg-ASPM-Key", "pci-aspm-default");
+    nub2->setProperty("VMD-Dbg-ASPM-Prop", (unsigned long long)0, 32);
+
+    // Root-port (downstream port) side of the same link: ASPM Control lives
+    // in BOTH partners; IOPCI2PCIBridge::setDeviceASPMState() always
+    // programs both and NVMeFix likewise walks SSD + bridge.
+    UInt8 rpcie = 0;
+    if (rp->findPCICapability(kIOPCIPCIExpressCapability, &rpcie) && rpcie) {
+        UInt16 rplctl = rp->configRead16(rpcie + 0x10);
+        nub2->setProperty("VMD-Dbg-RP-LNKCTL", rplctl, 16);
+        if (rplctl & 0x0003) {
+            rp->configWrite16(rpcie + 0x10, rplctl & ~0x0003);
+            nub2->setProperty("VMD-Dbg-RP-ASPM-Cleared", true);
+            nub2->setProperty("VMD-Dbg-RP-LNKCTL-New",
+                              rp->configRead16(rpcie + 0x10), 16);
+        }
+    }
+
+    // Endpoint side of the link + DLLLA wait.
+    UInt8 pcie = 0;
+    if (nub2->findPCICapability(kIOPCIPCIExpressCapability, &pcie) && pcie) {
+        UInt16 lctl = nub2->configRead16(pcie + 0x10);
+        nub2->setProperty("VMD-Dbg-EP-LNKCTL", lctl, 16);
+        if (lctl & 3) {
+            nub2->configWrite16(pcie + 0x10, lctl & ~0x0003);
+            nub2->setProperty("VMD-Dbg-EP-ASPM-Cleared", true);
+            nub2->setProperty("VMD-Dbg-EP-LNKCTL-New",
+                              nub2->configRead16(pcie + 0x10), 16);
+            IOSleep(1);
+        }
+
+        for (int i = 0; i < 100; i++) {
+            IODelay(100);
+            if (nub2->configRead16(pcie + 0x12) & 0x2000)   // LSTS.DLLLA
+                break;
+        }
+
+        IODelay(10000);
+    }
+
+    // Decode chain check + fix (registry properties on nub2).  Idempotent:
+    // the generic steps above already opened the windows this re-verifies.
+    vmdBridgeCheck(rp, nub2);
+
+    if (!isNVMe) return;
+
+    // CAP stability loop — after a reset some drives (Micron 2450 among
+    // them) answer config space but stay silent on MMIO for a while; poll
+    // CAP (read-only) until the controller answers instead of letting
+    // Apple's SetNVMeProperties() hit the all-ones assert.
+    stabilizeNVMeForCAP(rp, nub2);
+
+    // Apple IONVMeFamily init probe — registry properties on nub2, no
+    // IOLog.  Runs after D0 / ASPM-off / link-up so the MMIO reads see the
+    // same state IONVMeController::InitializePCI() will see when
+    // IONVMeFamily matches below.
+    appleNVMeInitDebug(nub2);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -1285,22 +1876,69 @@ static void vmdProgramWindow(IOPCIDevice *rp, uint8_t offset,
 /* CAP = BAR0+0x00 as two 32-bit little-endian reads (see appleNVMeInitDebug). */
 static inline uint64_t vmdReadCAP(volatile UInt8 *mmio)
 {
-    return OSReadLittleInt64(mmio, NVME_REG_CAP);
-    
     return (uint64_t)OSReadLittleInt32(mmio, NVME_REG_CAP)
          | ((uint64_t)OSReadLittleInt32(mmio, NVME_REG_CAP + 4) << 32);
 }
 
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * vmdBridgeCheck — VMD-device -> root-port -> endpoint decode chain.
+ * Registry-only debug: every value lands on nub2 as a "VMD-Dbg-RP-*" /
+ * "VMD-Dbg-DEV-*" property; no IOLog.
+ *
+ * Why: postScanConfigure() runs resetDomain() AFTER the configurator scan,
+ * and resetDomain() closes every bridge window behind the VMD.  The
+ * endpoint keeps its BAR assignment (so mapDeviceMemoryWithRegister() works
+ * and "the mmio bar is fine"), but the root port forwards no memory TLPs
+ * downstream, and the first controller read — IONVMeFamilyTA.c
+ * SetNVMeProperties()'s CAP = ReadRegister64(0) — master-aborts to
+ * 0xFFFFFFFFFFFFFFFF (the "( CAP != kNVMeInvalidRegisterValue64 )" assert,
+ * observed on pci1344,5411 Micron 2450).
+ *
+ * Fixes applied from config space alone:
+ *   - VMD device + root port + endpoint command.MEM (and bus master) set
+ *     when clear,
+ *   - root-port memory window reprogrammed over the endpoint's non-PF BARs
+ *     when closed or not covering them,
+ *   - prefetchable window likewise when the endpoint has PF BARs.
+ *
+ * Published (nub2):
+ *   VMD-Dbg-VMD-CMD        VMD device command register
+ *   VMD-Dbg-RP-CMD         root-port command register
+ *   VMD-Dbg-RP-MEM-Fixed   RP command.MEM/BM was off and was set
+ *   VMD-Dbg-RP-MEM-REG     raw 32-bit @0x20 (mem base|limit registers)
+ *   VMD-Dbg-RP-MEM-BASE/LIMIT   decoded window (host addresses)
+ *   VMD-Dbg-RP-MEM-Win-OK  endpoint non-PF BARs inside the window
+ *   VMD-Dbg-RP-MEM-Win-Fixed    window was reprogrammed
+ *   VMD-Dbg-RP-PF-*        same for the prefetchable window (@0x24)
+ *   VMD-Dbg-RP-SECSTS      bridge secondary status
+ *   VMD-Dbg-RP-Abort-History    RMA/RTA seen (confirms earlier master aborts)
+ *   VMD-Dbg-RP-LSTS / VMD-Dbg-RP-DLLLA   root-port link status
+ *   VMD-Dbg-EP-LSTS        endpoint link status
+ *   VMD-Dbg-DEV-VID/DID    endpoint identity (ECAM sanity)
+ *   VMD-Dbg-DEV-CMD        endpoint command register
+ *   VMD-Dbg-DEV-MEM-Fixed  endpoint command.MEM was off and was set
+ *   VMD-Dbg-BAR0-CFG       raw 64-bit BAR0 value from config space
+ *   VMD-Dbg-RP-Cfg-Dead    ECAM reads all-ones for the endpoint itself
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void VMDDriver::vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!rp || !nub2) return;
 
+    // ---- endpoint identity (ECAM sanity) ----------------------------------
     UInt16 vid = nub2->configRead16(kIOPCIConfigVendorID);
     UInt16 did = nub2->configRead16(kIOPCIConfigDeviceID);
+    nub2->setProperty("VMD-Dbg-DEV-VID", vid, 16);
+    nub2->setProperty("VMD-Dbg-DEV-DID", did, 16);
     if (vid == 0xFFFF) {
+        // ECAM itself is not answering for this device — nothing to fix.
+        nub2->setProperty("VMD-Dbg-RP-Cfg-Dead", true);
         return;
     }
 
+    // ---- collect the endpoint's memory BARs -------------------------------
+    // Same "reg"-property parsing as seedBridgeEntry(): each device-memory
+    // entry carries its BAR number in the address-space tag; prefetch-
+    // ability comes from the BAR register itself (bit 3).
     uint64_t memMin = ~0ULL, memMax = 0, pfMin = ~0ULL, pfMax = 0;
     uint64_t bar0Cfg = 0;
     bool haveMem = false, havePF = false;
@@ -1336,32 +1974,136 @@ void VMDDriver::vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2)
             haveMem = true;
         }
     }
+    nub2->setProperty("VMD-Dbg-BAR0-CFG", (unsigned long long)bar0Cfg, 64);
 
+    // No device-memory entries: fall back to the raw BAR0 config value so
+    // the window fix still has something to route to.
     if (!haveMem && !havePF && bar0Cfg && !(bar0Cfg & 0x1)) {
         uint64_t base = bar0Cfg & ~0xFULL;
         if (bar0Cfg & 0x8) { pfMin = pfMax = base; havePF = true; }
         else               { memMin = memMax = base; haveMem = true; }
     }
 
-    uint32_t memReg = rp->configRead32(PCI_MEMORY_BASE);
-    bool memOK = !haveMem || vmdWindowCovers(memReg, memMin, memMax);
-    if (haveMem && !memOK) {
-        vmdProgramWindow(rp, PCI_MEMORY_BASE, memMin, memMax);
+    // ---- endpoint command: MEM decode must be on for MMIO to answer -------
+    UInt16 devCmd = nub2->configRead16(kIOPCIConfigCommand);
+    nub2->setProperty("VMD-Dbg-DEV-CMD", devCmd, 16);
+    if ((devCmd & PCI_COMMAND_MEMORY) == 0) {
+        nub2->configWrite16(kIOPCIConfigCommand,
+                            devCmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+        IOSleep(2);
+        nub2->setProperty("VMD-Dbg-DEV-MEM-Fixed", true);
     }
 
+    // ---- VMD device command (top of the decode chain) ---------------------
+    UInt16 vmdCmd = fPCIDev->configRead16(kIOPCIConfigCommand);
+    nub2->setProperty("VMD-Dbg-VMD-CMD", vmdCmd, 16);
+    if ((vmdCmd & PCI_COMMAND_MEMORY) == 0) {
+        fPCIDev->configWrite16(kIOPCIConfigCommand,
+                               vmdCmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+        IOSleep(2);
+        nub2->setProperty("VMD-Dbg-VMD-MEM-Fixed", true);
+    }
+
+    // ---- root-port command ------------------------------------------------
+    UInt16 rpCmd = rp->configRead16(kIOPCIConfigCommand);
+    nub2->setProperty("VMD-Dbg-RP-CMD", rpCmd, 16);
+    if ((rpCmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
+                != (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) {
+        rp->configWrite16(kIOPCIConfigCommand,
+                          rpCmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+        IOSleep(2);
+        nub2->setProperty("VMD-Dbg-RP-MEM-Fixed", true);
+    }
+
+    // ---- root-port memory window ------------------------------------------
+    uint32_t memReg = rp->configRead32(PCI_MEMORY_BASE);
+    nub2->setProperty("VMD-Dbg-RP-MEM-REG", memReg, 32);
+    bool memOK = !haveMem || vmdWindowCovers(memReg, memMin, memMax);
+    nub2->setProperty("VMD-Dbg-RP-MEM-Win-OK", memOK);
+    if (haveMem && !memOK) {
+        vmdProgramWindow(rp, PCI_MEMORY_BASE, memMin, memMax);
+        nub2->setProperty("VMD-Dbg-RP-MEM-Win-Fixed", true);
+        memReg = rp->configRead32(PCI_MEMORY_BASE);
+    }
+    if (haveMem) {
+        nub2->setProperty("VMD-Dbg-RP-MEM-BASE",
+            (unsigned long long)(((uint64_t)(memReg & 0xFFF0)) << 16), 64);
+        nub2->setProperty("VMD-Dbg-RP-MEM-LIMIT",
+            (unsigned long long)(((((uint64_t)(memReg >> 16)) & 0xFFF0) << 16)
+                                 | 0xFFFFF), 64);
+    }
+
+    // ---- root-port prefetchable window ------------------------------------
     uint32_t pfReg = rp->configRead32(PCI_PREF_MEMORY_BASE);
+    nub2->setProperty("VMD-Dbg-RP-PF-REG", pfReg, 32);
     bool pfOK = !havePF || vmdWindowCovers(pfReg, pfMin, pfMax);
+    nub2->setProperty("VMD-Dbg-RP-PF-Win-OK", pfOK);
     if (havePF && !pfOK) {
         vmdProgramWindow(rp, PCI_PREF_MEMORY_BASE, pfMin, pfMax);
+        // 64-bit pref window upper halves — VMD windows live below 4 GB
         rp->configWrite32(PCI_PREF_BASE_UPPER32, 0);
         rp->configWrite32(PCI_PREF_LIMIT_UPPER32, 0);
         nub2->setProperty("VMD-Dbg-RP-PF-Win-Fixed", true);
         pfReg = rp->configRead32(PCI_PREF_MEMORY_BASE);
     }
+    if (havePF) {
+        nub2->setProperty("VMD-Dbg-RP-PF-BASE",
+            (unsigned long long)(((uint64_t)(pfReg & 0xFFF0)) << 16), 64);
+        nub2->setProperty("VMD-Dbg-RP-PF-LIMIT",
+            (unsigned long long)(((((uint64_t)(pfReg >> 16)) & 0xFFF0) << 16)
+                                 | 0xFFFFF), 64);
+    }
 
+    // ---- secondary status: master-abort history ---------------------------
+    UInt16 secsts = rp->configRead16(PCI_SEC_STATUS);
+    nub2->setProperty("VMD-Dbg-RP-SECSTS", secsts, 16);
+    if (secsts & (PCI_SEC_STATUS_RMA | PCI_SEC_STATUS_RTA)) {
+        nub2->setProperty("VMD-Dbg-RP-Abort-History", true);
+        rp->configWrite16(PCI_SEC_STATUS, secsts);   // write-1-to-clear
+    }
+
+    // ---- link status on both sides of the link ----------------------------
+    UInt8 rpPcie = 0, epPcie = 0;
+    if (rp->findPCICapability(kIOPCIPCIExpressCapability, &rpPcie) && rpPcie) {
+        UInt16 lsts = rp->configRead16(rpPcie + 0x12);
+        nub2->setProperty("VMD-Dbg-RP-LSTS", lsts, 16);
+        nub2->setProperty("VMD-Dbg-RP-DLLLA", (lsts & PCI_EXP_LNKSTA_DLLLA) != 0);
+    }
+    if (nub2->findPCICapability(kIOPCIPCIExpressCapability, &epPcie) && epPcie) {
+        UInt16 lsts = nub2->configRead16(epPcie + 0x12);
+        nub2->setProperty("VMD-Dbg-EP-LSTS", lsts, 16);
+        nub2->setProperty("VMD-Dbg-EP-DLLLA", (lsts & PCI_EXP_LNKSTA_DLLLA) != 0);
+    }
 }
 
-
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * stabilizeNVMeForCAP — poll until the controller answers MMIO (CAP).
+ * Registry-only debug; no IOLog.
+ *
+ * Even with the decode chain fixed, a drive that just came out of a
+ * secondary-bus reset can answer config space while its controller
+ * registers stay silent on MMIO for a while (pci1344,5411 Micron 2450
+ * firmware needs the settle time); an early read returns all-ones — the
+ * exact value Apple's SetNVMeProperties() asserts on.  This loop samples
+ * CAP (BAR0+0x00) — READ-ONLY, CC/CSTS stay pristine for Apple's
+ * DetermineBootState() — until it is neither all-ones nor zero, for up to
+ * 3 seconds, applying two config-space-only kicks while waiting:
+ *
+ *   - every 5th poll: toggle the endpoint's command.MEM — some devices
+ *     (re-)arm their decode logic only on a command-register write,
+ *   - at poll 10, if the link is still down: root-port LNKCTL.Retrain Link.
+ *
+ * Published (nub2):
+ *   VMD-Dbg-CAP-Pre     first CAP read (pre-loop)
+ *   VMD-Dbg-CAP-Last    last CAP read
+ *   VMD-Dbg-CAP-Polls   polls consumed (1..60)
+ *   VMD-Dbg-CAP-Stable  controller answered MMIO
+ *   VMD-Dbg-CAP-NoMap   BAR0 could not be mapped at all
+ *   VMD-Dbg-Kick-Decode / VMD-Dbg-Kick-Retrain   kicks applied
+ *
+ * The BAR0 mapping is stashed on the nub (VMDChildDevice::rmmio) and
+ * reused by appleNVMeInitDebug().
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 bool VMDDriver::stabilizeNVMeForCAP(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!nub2) return false;
@@ -1461,6 +2203,8 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
 
     // ---- config-space context (InitializePCI precondition) ---------------
     UInt16 cmdReg = nub2->configRead16(kIOPCIConfigCommand);
+    nub2->setProperty("VMD-Dbg-CMD", (unsigned long long)cmdReg, 16);
+    nub2->setProperty("VMD-Dbg-MEM-Decode", (cmdReg & 0x0002) != 0);
 
     VMDChildDevice *child = OSDynamicCast(VMDChildDevice, nub2);
     bool stashed = false;
@@ -1479,11 +2223,20 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
     }
     if (!bar0) {
         // InitializePCI() would fail: no map -> "( 0 != fBaseAddress )"
+        nub2->setProperty("VMD-Dbg-BAR0-Valid", false);
+        nub2->setProperty("VMD-Dbg-APL-InitOK", false);
         return;
     }
 
+    nub2->setProperty("VMD-Dbg-BAR0-Phys",
+                      (unsigned long long)bar0->getPhysicalAddress(), 64);
+    nub2->setProperty("VMD-Dbg-BAR0-Size",
+                      (unsigned long long)bar0->getLength(), 64);
+
     volatile UInt8 *mmio = (volatile UInt8 *)bar0->getVirtualAddress();
     if (!mmio) {
+        nub2->setProperty("VMD-Dbg-BAR0-Valid", false);
+        nub2->setProperty("VMD-Dbg-APL-InitOK", false);
         bar0->release();
         return;
     }
@@ -1491,9 +2244,13 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
     // Registers up to CSTS (0x1C) must be inside the mapping; NVMe BAR0 is
     // 16 KB per spec — anything smaller means the BAR assignment is broken.
     if (bar0->getLength() < NVME_REG_CSTS + 4) {
+        nub2->setProperty("VMD-Dbg-BAR0-Valid", false);
+        nub2->setProperty("VMD-Dbg-BAR0-TooSmall", true);
+        nub2->setProperty("VMD-Dbg-APL-InitOK", false);
         bar0->release();
         return;
     }
+    nub2->setProperty("VMD-Dbg-BAR0-Valid", true);
 
     // Keep the mapping on the nub for follow-up debugging (rmmio/rmmioPtr
     // exist for exactly this purpose; see the commented block above).
@@ -1687,50 +2444,286 @@ void VMDDriver::associateACPI(IOPCIConfigEntry *entry, IOPCIDevice *inheritFrom)
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * Child MSI wiring — the irq_domain equivalent.
+ * Child MSI wiring — the irq_domain equivalent (vmd_compose_msi_msg +
+ * vmd_next_irq + vmd_irq demux).
  *
- * IOPCI2PCIBridge::start() created a messaged-interrupt controller whose
- * vectors are the VMD device's MSI-X table entries.  For each child:
- *   - configureInterrupts(kIOInterruptTypePCIMessaged, 1, 1) allocates one
- *     vector for the child (vmd_msi_alloc()),
- *   - the allocated vector number is read back from the child's interrupt
- *     specifier (vmd_compose_msi_msg(): the VMD routes the child's MSI to
- *     MSI-X table entry <vector>),
- *   - the child's handler is (re-)registered on the VMD device at that
- *     vector, so a VMD MSI-X interrupt dispatches straight into the child
- *     driver (vmd_irq() -> generic_handle_irq()).
+ * With MSI remapping enabled, the VMD routes a child's MSI to its own
+ * MSI-X table entry selected by the message DESTINATION ID.  IOPCIFamily
+ * composes host messages (destid = CPU APIC id) and rewrites them at BOTH
+ * configureInterrupts() and registerInterrupt() time, so the rewrite runs
+ * from:
+ *   - wireChildMSI()          (scan time, before Apple matches),
+ *   - VMDChildDevice::configureInterrupts()  (Apple: CreateDeviceInterrupt,
+ *                              IONVMeFamilyTA.c:9544),
+ *   - VMDChildDevice::registerInterrupt()    (Apple's IOFilterInterrupt-
+ *                              EventSource attach — the LAST message write),
+ * and is idempotent: the vector is allocated once per child and reused.
+ *
+ * The dispatch side lives in VMDChildDevice::registerInterrupt(): Apple's
+ * (target, handler, refCon) is registered DIRECTLY on the VMD device at
+ * MSI-X vector fVmdVector, so IOPCIMessagedInterruptController programs
+ * VMD MSI-X entry <fVmdVector> with a real host message and dispatches it
+ * straight to Apple's IOInterruptEventSource (Linux: vmd_irq() ->
+ * generic_handle_irq()).  The child's own stock registration is kept for
+ * IOPCIFamily bookkeeping only; it can never dispatch, because the child's
+ * MSI is intercepted by the VMD and never reaches the CPU directly.
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void VMDDriver::wireChildMSI(IOPCIDevice *nub)
 {
     if (!nub) return;
 
-    uint8_t cap = 0;
-    if (!nub->findPCICapability(kIOPCICapabilityIDMSI, &cap) || !cap) return;
+    // breadcrumb FIRST — every early exit below must leave a trace
+    nub->setProperty("VMD-MSI-Pass", true);
 
-    if (!nub->getProperty("IOPCIMSIMode"))
-        nub->configureInterrupts(kIOInterruptTypePCIMessaged, 1, 1);
-
-    OSArray *specs = OSDynamicCast(OSArray,
-        nub->getPropertyTable()->getObject(gIOInterruptSpecifiersKey));
-    OSData *spec = specs ? OSDynamicCast(OSData, specs->getObject(0)) : NULL;
-    if (!spec || spec->getLength() < sizeof(uint32_t)) return;
-
-    uint32_t vmdVector = *(const uint32_t *)spec->getBytesNoCopy();
-
-    IOInterruptVector *vector = VMDChildDevice::msiVectorsOf(nub);
-    if (vector && vector->handler) {
-        fPCIDev->registerInterrupt(vmdVector, (OSObject *)vector->nub,
-                                   (IOInterruptAction)vector->handler,
-                                   vector->refCon);
-        IOLog("IntelVMD: child %02x:%02x.%x wired to VMD MSI-X vector %u\n",
-              nub->space.s.busNum, nub->space.s.deviceNum,
-              nub->space.s.functionNum, vmdVector);
+    // give the child a messaged interrupt before Apple matches, then
+    // compose it for the VMD (dispatch wiring happens later, in
+    // VMDChildDevice::registerInterrupt, once Apple provides a handler)
+    if (!nub->getProperty("IOPCIMSIMode")) {
+        IOReturn r = nub->configureInterrupts(kIOInterruptTypePCIMessaged,
+                                              1, 1);
+        nub->setProperty("VMD-MSI-Cfg-Stat", r, 32);
     }
 
-    // refresh the child's config shadow (power management)
+    composeChildMSI(nub);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * composeChildMSI — Linux vmd_compose_msi_msg(), ported.
+ *
+ *   msg->address_hi = X86_MSI_BASE_ADDRESS_HIGH;
+ *   msg->arch_addr_lo.base_address = X86_MSI_BASE_ADDRESS_LOW;
+ *   msg->arch_addr_lo.destid_0_7   = index_from_irqs(vmd, irq);
+ *
+ * I.e. the child's MSI message must be
+ *
+ *   address = 0xFEE00000 | (vmdVector << 12),  data = vmdVector
+ *
+ * where vmdVector indexes the VMD device's OWN MSI-X table (programmed
+ * with real host vectors by IOPCIDevice::configureInterrupts on fPCIDev —
+ * setupMSIX()).  Vector choice mirrors Linux vmd_next_irq(): NVMe devices
+ * (class 0x0108) get a private vector (first_vec+1 …), everything else
+ * shares first_vec.
+ *
+ * After rewriting the message the child's config shadow is refreshed so a
+ * later save/restore cycle cannot resurrect the host-composed message.
+ * Dispatch wiring is NOT done here — see VMDChildDevice::registerInterrupt.
+ *
+ * Registry-only diagnostics (no IOLog), published on the child nub:
+ *   VMD-MSI-Mode         "MSI-X" / "MSI"
+ *   VMD-MSI-Vec          VMD MSI-X vector index used as destid
+ *   VMD-MSI-AddrLo       composed message address (0xFEE00000|vec<<12)
+ *   VMD-MSI-Verify       read-back of MSI-X table entry 0 address
+ *   VMD-MSI-Verify-Ctrl  read-back of MSI-X table entry 0 vector-control
+ *   VMD-MSI-MSIX-En-Fixed  child MSI-X Enable was set by this driver
+ *   VMD-MSI-MSI-En-Fixed   child MSI Enable was set by this driver
+ *   VMD-MSI-MSI-Cleared    child MSI Enable cleared for the MSI-X switch
+ *   VMD-MSI-Host-AddrLo  VMD's own MSI-X entry <vec> address readback
+ *   VMD-MSI-Host-Ctrl    VMD's own MSI-X entry <vec> vector-control
+ *
+ * Gate breadcrumbs (wireChildMSI / composeChildMSI) — set INSTEAD of the
+ * old silent early-returns, so a missing VMD-MSI-* tree in the registry is
+ * itself diagnostic:
+ *   VMD-MSI-Model         "bypass-stock" (compose skipped: stock MSI path
+ *                         owns the child) / "demux" on the VMD node
+ *   VMD-MSI-Pass          wireChildMSI() entered for this nub
+ *   VMD-MSI-Cfg-Stat      wireChildMSI's own configureInterrupts() result
+ *   VMD-MSI-NoVmdDev      fPCIDev missing (should never happen)
+ *   VMD-MSI-NoMsixTable   fMsixCount == 0 (setupMSIX() did not size a table;
+ *                         normal in bypass mode — gate is reached first)
+ *   VMD-MSI-NoMessageCap  device has neither a writable MSI-X table nor a
+ *                         programmable MSI capability
+ * On the VMD node itself: VMD-Stage-* (start pipeline), VMD-MSIX-* (the
+ * VMD device's own MSI-X setup), VMD-Stage-Scan-Children /
+ * VMD-Stage-PostScan-* (scan + fix-up pass census), VMD-MSI-Model.
+ * Power path: VMD-PM-Hook / VMD-PM-Reassert on each waking nub.
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void VMDDriver::composeChildMSI(IOPCIDevice *nub)
+{
+    if (!nub) return;
+
+    // The configurator scan builds stock IOPCIDevice nubs
+    // (IOPCIConfigurator.cpp: OSTypeAlloc(IOPCIDevice) — createNub() is
+    // never called on this path), so there is no VMDChildDevice here and
+    // no per-child fVmdVector ivar: the vector lives in the nub's own
+    // "VMD-MSI-Vec" property instead.  Under the bypass model nothing is
+    // composed at all — the stock messaged-interrupt controller owns the
+    // child's MSI message end to end (Linux vmd_probe(): bypass devices
+    // create no irq_domain, linuxvmd.c:991).
+    if (!fDemuxMode) {
+        nub->setProperty("VMD-MSI-Model", "bypass-stock");
+        return;
+    }
+    if (!fPCIDev) {
+        nub->setProperty("VMD-MSI-NoVmdDev", true);
+        return;
+    }
+    if (!fMsixCount) {
+        nub->setProperty("VMD-MSI-NoMsixTable", true);
+        return;
+    }
+
+    // ---- vector allocation (Linux vmd_next_irq) ------------------------
+    uint32_t cls = nub->configRead32(kIOPCIConfigRevisionID) >> 16;
+
+    OSNumber *vecProp =
+        OSDynamicCast(OSNumber, nub->getProperty("VMD-MSI-Vec"));
+    if (!vecProp) {
+        uint32_t nv;
+        if ((cls == VMD_CLASS_NVME)
+            && (fMsixCount > (uint32_t)fFirstVec + 1)
+            && (fNextFreeVec < fMsixCount)) {
+            nv = fNextFreeVec++;
+        } else {
+            nv = fFirstVec;
+        }
+        nub->setProperty("VMD-MSI-Vec", nv, 32);
+        vecProp = OSDynamicCast(OSNumber, nub->getProperty("VMD-MSI-Vec"));
+    }
+    uint32_t vec    = vecProp ? vecProp->unsigned32BitValue() : fFirstVec;
+    uint32_t addrLo = X86_MSI_BASE_ADDRESS_LOW  | (vec << X86_MSI_DESTID_SHIFT);
+    uint32_t addrHi = X86_MSI_BASE_ADDRESS_HIGH;
+    if (vec >= fMsixCount) {                /* degenerate msix_count */
+        nub->setProperty("VMD-MSI-NoVec", true);
+        return;
+    }
+
+    bool wrote = false;
+
+    // ---- MSI-X: rewrite the table entries inside the device's BAR ------
+    uint8_t cap = 0;
+    if (nub->findPCICapability(kIOPCICapabilityIDMSIX, &cap) && cap) {
+        uint16_t ctrl = nub->configRead16(cap + PCI_MSIX_FLAGS);
+        nub->setProperty("VMD-MSI-Mode", "MSI-X");
+        nub->setProperty("VMD-MSI-Ctrl", ctrl, 16);
+        if (((ctrl & PCI_MSIX_FLAGS_ENABLE) == 0) && (cls == VMD_CLASS_NVME)) {
+            // Stock configureInterrupts() left MSI-X disabled (or never
+            // succeeded).  A disabled MSI-X block can never fire, so enable
+            // it for the NVMe endpoint ourselves.  Per the PCI local bus
+            // spec MSI Enable must be clear while MSI-X is enabled.
+            uint8_t msiCap = 0;
+            if (nub->findPCICapability(kIOPCICapabilityIDMSI, &msiCap)
+                && msiCap) {
+                uint16_t msiCtrl = nub->configRead16(msiCap + PCI_MSI_FLAGS);
+                if (msiCtrl & PCI_MSI_FLAGS_ENABLE) {
+                    nub->configWrite16(msiCap + PCI_MSI_FLAGS,
+                                       msiCtrl & ~PCI_MSI_FLAGS_ENABLE);
+                    nub->setProperty("VMD-MSI-MSI-Cleared", true);
+                }
+            }
+            ctrl |= PCI_MSIX_FLAGS_ENABLE;
+            nub->configWrite16(cap + PCI_MSIX_FLAGS, ctrl);
+            ctrl = nub->configRead16(cap + PCI_MSIX_FLAGS);
+            if (ctrl & PCI_MSIX_FLAGS_ENABLE)
+                nub->setProperty("VMD-MSI-MSIX-En-Fixed", true);
+        }
+        if (ctrl & PCI_MSIX_FLAGS_ENABLE) {
+            uint32_t tobir = nub->configRead32(cap + PCI_MSIX_TABLE_OFFSET);
+            uint8_t  bir   = tobir & 7;
+            uint64_t toff  = tobir & ~7ULL;
+            IOMemoryMap *bar = nub->mapDeviceMemoryWithRegister(
+                        kIOPCIConfigBaseAddress0 + 4 * bir,
+                        kIOMapInhibitCache | kIOMapAnywhere);
+            if (bar) {
+                volatile UInt8 *table =
+                    (volatile UInt8 *)bar->getVirtualAddress() + toff;
+                uint16_t nvec = (ctrl & 0x7FF) + 1;
+                for (uint16_t i = 0; i < nvec; i++) {
+                    volatile UInt32 *entry = (volatile UInt32 *)
+                        (table + (uint32_t)i * PCI_MSIX_ENTRY_SIZE);
+                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_UPPER_ADDR, addrHi);
+                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_LOWER_ADDR, addrLo);
+                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_DATA, vec);
+                    // Vector Control bit 0 = Mask.  Entries come up masked
+                    // after reset and a masked entry swallows the interrupt
+                    // even with MSI-X enabled; IOPCIFamily only unmasks
+                    // vectors it allocated through the stock path.
+                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_VECTOR_CTRL, 0);
+                }
+                nub->setProperty("VMD-MSI-AddrLo",
+                                 (unsigned long long)addrLo, 32);
+                nub->setProperty("VMD-MSI-Verify",
+                    OSReadLittleInt32((volatile UInt32 *)table,
+                                      PCI_MSIX_ENTRY_LOWER_ADDR), 32);
+                nub->setProperty("VMD-MSI-Verify-Ctrl",
+                    OSReadLittleInt32((volatile UInt32 *)table,
+                                      PCI_MSIX_ENTRY_VECTOR_CTRL), 32);
+                bar->release();
+                wrote = true;
+            } else {
+                nub->setProperty("VMD-MSI-Table-Map-Failed", true);
+            }
+        }
+    }
+
+    // ---- MSI: rewrite the capability message ----------------------------
+    if (!wrote
+        && nub->findPCICapability(kIOPCICapabilityIDMSI, &cap) && cap) {
+        uint16_t ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
+        nub->setProperty("VMD-MSI-Mode", "MSI");
+        if (((ctrl & PCI_MSI_FLAGS_ENABLE) == 0) && (cls == VMD_CLASS_NVME)) {
+            // No messaged interrupt was ever enabled on the device (stock
+            // configureInterrupts() failed or was never run) — a disabled
+            // MSI block can never fire.  Enable it ourselves.
+            ctrl |= PCI_MSI_FLAGS_ENABLE;
+            nub->configWrite16(cap + PCI_MSI_FLAGS, ctrl);
+            ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
+            if (ctrl & PCI_MSI_FLAGS_ENABLE)
+                nub->setProperty("VMD-MSI-MSI-En-Fixed", true);
+        }
+        if (ctrl & PCI_MSI_FLAGS_ENABLE) {
+            nub->configWrite32(cap + PCI_MSI_MSG_LOWER_ADDRESS, addrLo);
+            if (ctrl & PCI_MSI_FLAGS_64BIT) {
+                nub->configWrite32(cap + PCI_MSI_MSG_UPPER_ADDRESS, addrHi);
+                nub->configWrite16(cap + PCI_MSI_MSG_DATA_64, (UInt16)vec);
+            } else {
+                nub->configWrite16(cap + PCI_MSI_MSG_DATA_32, (UInt16)vec);
+            }
+            nub->setProperty("VMD-MSI-AddrLo",
+                             (unsigned long long)addrLo, 32);
+            wrote = true;
+        }
+    }
+
+    if (!wrote) {
+        // neither a writable MSI-X table nor a programmable MSI capability
+        nub->setProperty("VMD-MSI-NoMessageCap", true);
+        return;
+    }
+
+    // ---- evidence: VMD's own MSI-X entry <vec> carries the host message ------
+    {
+        uint8_t hcap = 0;
+        if (fPCIDev->findPCICapability(kIOPCICapabilityIDMSIX, &hcap)
+            && hcap) {
+            uint32_t htobir =
+                fPCIDev->configRead32(hcap + PCI_MSIX_TABLE_OFFSET);
+            uint8_t  hbir  = htobir & 7;
+            uint64_t htoff = htobir & ~7ULL;
+            IOMemoryMap *hbar = fPCIDev->mapDeviceMemoryWithRegister(
+                        kIOPCIConfigBaseAddress0 + 4 * hbir,
+                        kIOMapInhibitCache | kIOMapAnywhere);
+            if (hbar) {
+                volatile UInt8 *htab =
+                    (volatile UInt8 *)hbar->getVirtualAddress() + htoff;
+                volatile UInt32 *hentry = (volatile UInt32 *)
+                    (htab + (uint32_t)vec * PCI_MSIX_ENTRY_SIZE);
+                nub->setProperty("VMD-MSI-Host-AddrLo",
+                    OSReadLittleInt32(hentry, PCI_MSIX_ENTRY_LOWER_ADDR),
+                    32);
+                nub->setProperty("VMD-MSI-Host-Ctrl",
+                    OSReadLittleInt32(hentry, PCI_MSIX_ENTRY_VECTOR_CTRL),
+                    32);
+                hbar->release();
+            }
+        }
+    }
+
+    // ---- refresh the config shadow: a later save/restore cycle must not
+    //      resurrect the host-composed message ----------------------------
     IOPCIConfigShadow *shadow = configShadow(nub);
-    for (int i = 0; i < kIOPCIConfigEPShadowRegs; i++)
-        shadow->configSave.savedConfig[i] = nub->configRead32(i * 4);
+    if (shadow)
+        for (int i = 0; i < kIOPCIConfigEPShadowRegs; i++)
+            shadow->configSave.savedConfig[i] = nub->configRead32(i * 4);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -1880,18 +2873,6 @@ IOPCIAddressSpace VMDDriver::getBridgeSpace(void)
     return fBridgeSpace;
 }
 
-/* Nub factory — the configurator scan creates VMDChildDevice instances for
- * every device it finds behind the VMD. */
-IOPCIDevice * VMDDriver::createNub(OSDictionary *from)
-{
-    VMDChildDevice *nub = new VMDChildDevice;
-    if (nub && !nub->init(from)) {
-        nub->release();
-        return NULL;
-    }
-    if (nub) nub->pvmd = this;
-    return nub;
-}
 
 /* Vector 0 is reserved when VMD_FEAT_OFFSET_FIRST_VECTOR is set (Linux:
  * "Device may use MSI-X vector 0 for software triggering and will not be
@@ -1941,204 +2922,675 @@ IOInterruptVector * VMDChildDevice::msiVectorsOf(IOPCIDevice *device)
     return ((VMDChildDevice *)device)->reserved->msiVectors;
 }
 
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * VMDChildDevice decode-chain re-assert hooks.
- *
- * Boot-3 evidence (pci1344,5411): postScanConfigure() probed a perfectly
- * valid controller (VMD-Dbg-CAP = 0x1000304003ffff: MQES 0xffff, CQR 1,
- * TO 0x40 -> APL-InitTimeoutMS 0x7d00, DSTRD 0, CSS-NVM 1, MPSMIN 0,
- * MPSMAX 1, VS 1.4.0; all four VMD-Dbg-APL-*-OK true; APL-InitOK true) --
- * yet Apple's IONVMeController::start() still died on the same CAP assert,
- * and VMD-Dbg-RP-Abort-History was true again although vmdBridgeCheck()
- * clears RMA/RTA before the probe.  Master aborts recorded AFTER the probe
- * mean the VMD-device -> root-port -> endpoint decode chain is being
- * clobbered between postScanConfigure() and Apple's first MMIO read.
- *
- * Prime clobberer, found in the published IOPCIFamily 726.100.6 source:
- * IOPCI2PCIBridge::checkLink() (IOPCIBridge.cpp:4835).  It samples
- * LNKSTA.DLLLA (bit 13) of the bridge device; on a 1 -> 0 "presence"
- * transition it disables the bridge and zeroes the windows:
- *
- *     fBridgeDevice->configWrite32(kPCI2PCIMemoryRange,         0);  // :4905
- *     fBridgeDevice->configWrite32(kPCI2PCIPrefetchMemoryRange, 0);  // :4906
- *     fBridgeDevice->configWrite32(kPCI2PCIPrefetchUpperBase,   0);  // :4907
- *     fBridgeDevice->configWrite32(kPCI2PCIPrefetchUpperLimit,  0);  // :4908
- *
- * checkLink(kCheckLinkForPower) also polls inside the D0 "wait for link up"
- * loop (IOPCIBridge.cpp:6869) -- the first polls run while the link is still
- * training, so DLLLA reads 0, "present" flips false, and the windows are
- * zeroed and never restored (IOPCIFamily itself only ever programs windows
- * to zero; it relies on firmware for the assignment).
- *
- * The hooks below re-assert the chain at the two last controllable points:
- *   - start():                        stock IOPCIDevice::start finished,
- *                                     drivers have not matched yet,
- *   - mapDeviceMemoryWithRegister():  the exact call Apple's
- *                                     IONVMeController::InitializePCI()
- *                                     makes for BAR0 (reg 0x10) right
- *                                     before ReadRegister64(CAP).
- * All results land on this nub as VMD-Dbg-Hook-* properties; no IOLog.
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static uint32_t vmdHookCallCount = 0;
 
-void VMDChildDevice::reassertDecodeChain(const char *why)
+IOReturn VMDChildDevice::configureInterrupts(UInt32 interruptType,
+                                             UInt32 numRequired,
+                                             UInt32 numRequested,
+                                             IOOptionBits options)
 {
-    // Only endpoints behind a type-1 bridge have a chain to assert.  Root-
-    // port nubs (provider = the VMD device, header type 0) must not walk
-    // above the VMD device.
-    IOPCIDevice *rp = OSDynamicCast(IOPCIDevice, getProvider());
-    if (!rp) return;
-    UInt8 rpHdr = rp->configRead8(kIOPCIConfigHeaderType) & 0x7f;
-    if (rpHdr != 1) return;
-    IOPCIDevice *vmdDev = OSDynamicCast(IOPCIDevice, rp->getProvider());
-
-    setProperty("VMD-Dbg-Hook-Why", why);
-    setProperty("VMD-Dbg-Hook-Cnt", (unsigned long long)++vmdHookCallCount, 32);
-
-    // Endpoint must be alive in ECAM.
-    UInt16 vid = configRead16(this->space,kIOPCIConfigVendorID);
-    if (vid == 0xFFFF) {
-        setProperty("VMD-Dbg-Hook-Cfg-Dead", true);
-        return;
-    }
-
-    // ---- live BAR inventory (config space wins over scan descriptors) -----
-    uint64_t memMin = ~0ULL, memMax = 0, pfMin = ~0ULL, pfMax = 0;
-    bool haveMem = false, havePF = false;
-    uint64_t bar0Live = 0;
-
-    OSArray *deviceMemory = getDeviceMemory();
-    for (int barIdx = 0; barIdx < 6; ) {
-        uint32_t lo = configRead32(this->space,kIOPCIConfigBaseAddress0 + 4 * barIdx);
-        if (lo == 0xFFFFFFFFU) break;
-        if (lo & 0x1) { barIdx++; continue; }          // I/O BAR -- n/a here
-        bool isPF = (lo & 0x8) != 0;
-        bool is64 = (((lo >> 1) & 0x3) == 0x2);
-        uint32_t hi = 0;
-        if (is64) hi = configRead32(this->space,kIOPCIConfigBaseAddress0 + 4 * barIdx + 4);
-        if (barIdx == 0) bar0Live = ((uint64_t)hi << 32) | lo;
-        uint64_t base = (((uint64_t)hi << 32) | lo) & ~0xFULL;
-        uint64_t len  = 0;
-        for (uint32_t idx = 0; deviceMemory; idx++) {
-            IOMemoryDescriptor *mem =
-                (IOMemoryDescriptor *)deviceMemory->getObject(idx);
-            if (!mem) break;
-            IOPCIAddressSpace tag;
-            tag.bits = mem->getTag();
-            if (tag.s.registerNum
-                    == (kIOPCIConfigBaseAddress0 + 4 * barIdx)) {
-                len = mem->getLength();
-                break;
-            }
-        }
-        if (base) {
-            // Unknown length (no scan descriptor): assume 1 MB, which is
-            // also the window granularity, so it cannot over-close.
-            uint64_t end  = base + ((len) ? (len - 1) : 0xFFFFFULL);
-            if (isPF) {
-                pfMin = (base < pfMin) ? base : pfMin;
-                pfMax = (end  > pfMax) ? end  : pfMax;
-                havePF = true;
-            } else {
-                memMin = (base < memMin) ? base : memMin;
-                memMax = (end  > memMax) ? end  : memMax;
-                haveMem = true;
-            }
-        }
-        barIdx += is64 ? 2 : 1;
-    }
-    setProperty("VMD-Dbg-Hook-BAR0", (unsigned long long)bar0Live, 64);
-
-    uint32_t fixes = 0;
-
-    // ---- endpoint command + power state ------------------------------------
-    UInt16 devCmd = configRead16(this->space,kIOPCIConfigCommand);
-    setProperty("VMD-Dbg-Hook-DEV-CMD", devCmd, 16);
-    if ((devCmd & PCI_COMMAND_MEMORY) == 0) {
-        configWrite16(this->space,kIOPCIConfigCommand,
-                      devCmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
-        setProperty("VMD-Dbg-Hook-DEV-CMD-Fixed", true);
-        fixes++;
-    }
-    UInt8 pm = 0;
-    if (findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) {
-        UInt16 pmcsr = configRead16(this->space,pm + 4);
-        setProperty("VMD-Dbg-Hook-DEV-PMCSR", pmcsr, 16);
-        if (pmcsr & 0x3) {                         // D1/D2/D3 -> D0
-            configWrite16(this->space,pm + 4, pmcsr & ~0x0003);
-            IOSleep(10);
-            setProperty("VMD-Dbg-Hook-DEV-D0-Fixed", true);
-            fixes++;
-        }
-    }
-
-    // ---- VMD device command (top of the decode chain) ----------------------
-    if (vmdDev) {
-        UInt16 vmdCmd = vmdDev->configRead16(kIOPCIConfigCommand);
-        setProperty("VMD-Dbg-Hook-VMD-CMD", vmdCmd, 16);
-        if ((vmdCmd & PCI_COMMAND_MEMORY) == 0) {
-            vmdDev->configWrite16(kIOPCIConfigCommand,
-                                  vmdCmd | PCI_COMMAND_MEMORY
-                                        | PCI_COMMAND_MASTER);
-            setProperty("VMD-Dbg-Hook-VMD-CMD-Fixed", true);
-            fixes++;
-        }
-    }
-
-    // ---- root-port command + windows ---------------------------------------
-    UInt16 rpCmd = rp->configRead16(kIOPCIConfigCommand);
-    setProperty("VMD-Dbg-Hook-RP-CMD", rpCmd, 16);
-    if ((rpCmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
-                != (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) {
-        rp->configWrite16(kIOPCIConfigCommand,
-                          rpCmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
-        setProperty("VMD-Dbg-Hook-RP-CMD-Fixed", true);
-        fixes++;
-    }
-
-    if (haveMem) {
-        uint32_t memReg = rp->configRead32(PCI_MEMORY_BASE);
-        setProperty("VMD-Dbg-Hook-RP-MEM-REG", memReg, 32);
-        if (!vmdWindowCovers(memReg, memMin, memMax)) {
-            vmdProgramWindow(rp, PCI_MEMORY_BASE, memMin, memMax);
-            setProperty("VMD-Dbg-Hook-RP-MEM-Fixed", true);
-            fixes++;
-            setProperty("VMD-Dbg-Hook-RP-MEM-REG-After",
-                        rp->configRead32(PCI_MEMORY_BASE), 32);
-        }
-    }
-    if (havePF) {
-        uint32_t pfReg = rp->configRead32(PCI_PREF_MEMORY_BASE);
-        setProperty("VMD-Dbg-Hook-RP-PF-REG", pfReg, 32);
-        if (!vmdWindowCovers(pfReg, pfMin, pfMax)) {
-            vmdProgramWindow(rp, PCI_PREF_MEMORY_BASE, pfMin, pfMax);
-            rp->configWrite32(PCI_PREF_BASE_UPPER32, 0);
-            rp->configWrite32(PCI_PREF_LIMIT_UPPER32, 0);
-            setProperty("VMD-Dbg-Hook-RP-PF-Fixed", true);
-            fixes++;
-        }
-    }
-
-    setProperty("VMD-Dbg-Hook-Fixes", fixes, 32);
+    IOReturn ret = IOPCIDevice::configureInterrupts(interruptType,
+                                                    numRequired,
+                                                    numRequested, options);
+    setProperty("VMD-MSI-AppleCfg-Type", interruptType, 32);
+    setProperty("VMD-MSI-AppleCfg-Stat", ret, 32);
+    if (pvmd) pvmd->composeChildMSI(this);
+    return ret;
 }
 
-bool VMDChildDevice::start(IOService *provider)
+IOReturn VMDChildDevice::registerInterrupt(int source, OSObject *target,
+                                           IOInterruptAction handler,
+                                           void *refCon)
 {
-    bool ok = IOPCIDevice::start(provider);
-    // Stock start may have run configurator / power transitions over the
-    // decode chain (see checkLink() note above).  Drivers have not matched
-    // yet -- assert the chain once here before anyone matches on us.
-    if (ok) reassertDecodeChain("start");
-    return ok;
+    IOReturn ret = IOPCIDevice::registerInterrupt(source, target, handler,
+                                                  refCon);
+    setProperty("VMD-MSI-AppleReg-Stat", ret, 32);
+
+
+    IOPCIDevice *vdev = pvmd ? pvmd->vmdDevice() : NULL;
+    if (vdev && fVmdVector != 0xFFFFFFFFU) {
+        IOReturn r = vdev->registerInterrupt((int)fVmdVector, target,
+                                             handler, refCon);
+        if (r == kIOReturnSuccess) {
+            vdev->enableInterrupt((int)fVmdVector);
+            setProperty("VMD-MSI-Direct", fVmdVector, 32);
+            if (ret != kIOReturnSuccess)
+                ret = kIOReturnSuccess;
+        }
+        setProperty("VMD-MSI-Direct-Stat", r, 32);
+    }
+
+    if (pvmd) pvmd->composeChildMSI(this);
+    return ret;
 }
 
 IOMemoryMap * VMDChildDevice::mapDeviceMemoryWithRegister(UInt8 reg,
                                                           IOOptionBits options)
 {
-    // Apple's IONVMeController::InitializePCI() lands here for reg 0x10
-    // (BAR0) and then reads CAP through the returned mapping.  Assert the
-    // decode chain at this exact moment so the first MMIO read cannot
-    // master-abort to 0xFFFFFFFFFFFFFFFF.
-    reassertDecodeChain("map");
+    //if (reg==0x10 && rmmio) return rmmio;
     return IOPCIDevice::mapDeviceMemoryWithRegister(reg, options);
+}
+
+void IOPCIConfigurator::doConfigure(uint32_t options)
+{
+    bool bootConfig = (kIOPCIConfiguratorBoot & options);
+
+    if (bootConfig) 
+        iterate("boot reset", &IOPCIConfigurator::scanProc,&IOPCIConfigurator::bootResetProc,this);
+    
+    iterate("scan total", &IOPCIConfigurator::scanProc,&IOPCIConfigurator::totalProc,NULL);
+    iterate("allocate",   &IOPCIConfigurator::allocateProc,NULL,NULL);
+    iterate("finalize",   &IOPCIConfigurator::bridgeFinalizeConfigProc, &IOPCIConfigurator::domainFinalizeConfigProc, NULL);
+}
+
+int32_t IOPCIConfigurator::bridgeFinalizeConfigProc(void * unused, IOPCIConfigEntry * bridge)
+{
+    uint32_t deviceControl, newControl;
+
+    if (!(kPCIDeviceStateAllocated & bridge->deviceState)) return (true);
+    bridge->deviceState &= ~kPCIDeviceStateChildChanged;
+
+#if defined(__i386__) || defined(__x86_64__)
+    if ((kPCIHPTypeMask & bridge->supportsHotPlug) >= kPCIHotPlug)
+#endif
+    {
+        FOREACH_CHILD(bridge, child)
+        {
+            if (kPCIDeviceStateDeadOrHidden   & child->deviceState) continue;
+            if (!child->expressCapBlock)                             continue;
+            // Re-calculate Device Control settings if either the domain changed or we paused to service an MPS update
+            if (!(child->rootPortEntry->deviceState & kPCIDeviceStateDomainChanged) && !(fStates & kIOPCIConfiguratorMPSOverridePause)) continue;
+            deviceControl = configRead16(child, child->expressCapBlock + 0x08);
+            if ((fStates & kIOPCIConfiguratorMPSOverride) && (child->deviceState & kPCIDeviceStatePaused))
+            {
+                fStates &= ~kIOPCIConfiguratorMPSOverride;
+                // in the future, we want to intelligently set RP MPS to the lowest MPS in the topology
+                // for now, we will set RP MPS = 128B until pause is more stable
+                child->rootPortEntry->expressMaxPayload = MIN_MPS;
+                // since the root port is not paused, this is the USP connected to the root port. We need to manually update root port's MPS.
+                uint32_t rootPortDeviceControl = configRead16(child->rootPortEntry, child->rootPortEntry->expressCapBlock + 0x08);
+                uint32_t rootPortNewControl = rootPortDeviceControl & ~(7 << 5);
+                rootPortNewControl |= ((child->rootPortEntry->expressMaxPayload & 7) << 5);
+                configWrite16(child->rootPortEntry, child->rootPortEntry->expressCapBlock + 0x08, rootPortNewControl);
+            }
+            newControl    = deviceControl & ~(7 << 5);
+            newControl    |= ((child->rootPortEntry->expressMaxPayload & 7) << 5);
+            if (!child->isBridge && (child->hostBridgeEntry->expressEndpointMaxReadRequestSize != -1))
+            {
+                newControl = newControl & ~(7 << 12);
+                newControl |= (child->hostBridgeEntry->expressEndpointMaxReadRequestSize << 12);
+            }
+            if (newControl != deviceControl)
+            {
+                configWrite16(child, child->expressCapBlock + 0x08, newControl);
+            }
+        }
+    }
+
+    if ((kPCIDeviceStateChildAdded & bridge->deviceState) && !fWaitingPause)
+    {
+        bridge->deviceState &= ~kPCIDeviceStateChildAdded;
+        markChanged(bridge);
+    }
+
+    return (bridgeConstructDeviceTree(unused, bridge));
+}
+
+void IOPCIConfigurator::configure(uint32_t options)
+{
+    bool bootConfig = (kIOPCIConfiguratorBoot & options);
+
+
+    // An Endpoint may return CRS after a Reset which requires up to 1s wait time
+    // for Successful response. However it is arguable that boot is a form of reset.
+    // rdar://106326237 shows that the Endpoint responded with CRS on boot scan
+    fResetStartTime = mach_absolute_time();
+    // Time scale is millisecond
+    // Per PCIE Base spec v5.0, PCIE device must link train, initialize, and return
+    // successful completion to valid Config Request 1s after reset exit
+    // So we're supposed to wait 900ms since we waited 100ms after link up
+    fResetWaitTime = kIOPCIEnumerationWaitTime;
+
+    PE_Video           consoleInfo;
+
+    fFlags |= options;
+
+#if defined(__i386__) || defined(__x86_64__)
+    if (bootConfig)
+    {
+        IOService::getPlatform()->getConsoleInfo(&consoleInfo);
+
+        if (!fPFMConsole)
+        {
+            fPFMConsole  = consoleInfo.v_baseAddr;
+#ifndef __LP64__
+            fPFMConsole |= (((uint64_t) consoleInfo.v_baseAddrHigh) << 32);
+#endif
+
+        }
+        fConsoleRange = NULL;
+        getPlatform()->setConsoleInfo(0, kPEDisableScreen);
+    }
+#endif
+
+    doConfigure(options);
+
+#if defined(__i386__) || defined(__x86_64__)
+    if (bootConfig)
+    {
+        if (fConsoleRange)
+        {
+            if (fConsoleRange->start)
+                fPFMConsole += fConsoleRange->start;
+            else
+                fPFMConsole = 0;
+        }
+        if (!fPFMConsole)
+        {
+        }
+        else
+        {
+            if (fConsoleRange)
+            {
+                consoleInfo.v_baseAddr = (fPFMConsole | 1);
+#ifdef __LP64__
+#else
+                consoleInfo.v_baseAddrHigh = (fPFMConsole >> 32);
+                DLOG("console setting 0x%lx:%lx\n",
+                    consoleInfo.v_baseAddrHigh, consoleInfo.v_baseAddr);
+#endif
+                getPlatform()->setConsoleInfo(&consoleInfo, kPEBaseAddressChange);
+            }
+            getPlatform()->setConsoleInfo(NULL, kPEEnableScreen);
+            if (fConsoleRange)
+                IOLog("console relocated to 0x%llx\n", fPFMConsole);
+        }
+    }
+#endif
+
+    fFlags &= ~options;
+
+    fResetStartTime = 0;
+    fResetWaitTime = 0;
+}
+
+IOReturn IOPCIConfigurator::configOp(IOService * device, uintptr_t op, void * arg, void * arg2)
+{
+    IOReturn           ret = kIOReturnUnsupported;
+    IOPCIConfigEntry * entry = NULL;
+    IOPCIDevice *      pciDevice;
+
+    if ((pciDevice = OSDynamicCast(IOPCIDevice, device)))
+        entry = pciDevice->reserved->configEntry;
+
+    switch (op)
+    {
+        case kConfigOpAddHostBridge:
+            ret = addHostBridge(OSDynamicCast(IOPCIHostBridge, device));
+            return (ret);
+            break;
+
+        case kConfigOpGetState:
+            if (!entry) *((uint32_t *) arg) = kPCIDeviceStateDead;
+            else
+            {
+                *((uint32_t *) arg) = entry->deviceState;
+            }
+            ret = kIOReturnSuccess;
+            return (ret);
+            break;
+
+
+        case kConfigOpFindEntry:
+            entry = findEntry(device, *((IOPCIAddressSpace *) arg2));
+            *((void **) arg) = NULL;
+            if (!entry || !entry->dtNub) ret = kIOReturnNotFound;
+            else
+            {
+                entry->dtNub->retain();
+                *((void **) arg) = entry->dtNub;
+                ret = kIOReturnSuccess;
+            }
+            return (ret);
+            break;
+
+        case kConfigOpFindEntryByAddress:
+            entry = findEntryByAddress(device, *((IOPCIScalar *) arg2));
+            *((void **) arg) = NULL;
+            if (!entry || !entry->dtNub) ret = kIOReturnNotFound;
+            else
+            {
+                entry->dtNub->retain();
+                *((void **) arg) = entry->dtNub;
+                ret = kIOReturnSuccess;
+            }
+            return (ret);
+            break;
+
+        case kConfigOpTerminated:
+            if (entry)
+            {
+                bridgeRemoveChild(entry->parent, entry);
+            }
+            ret = kIOReturnSuccess;
+            return (ret);
+            break;
+    }
+
+    if (!entry) return (kIOReturnBadArgument);
+
+    switch (op)
+    {
+        case kConfigOpNeedsScan:
+            entry->deviceState &= ~kPCIDeviceStateScanned;
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpLinkInt:
+            entry->deviceState |= kPCIDeviceStateLinkInt;
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpShadowed:
+            entry->configShadow = (uint8_t *) arg;
+            ret = kIOReturnSuccess;
+            if (!arg) break;
+            /* fall thru */
+        case kConfigOpPaused:
+
+            if (kPCIDeviceStateRequestPause & entry->deviceState)
+            {
+                entry->deviceState &= ~kPCIDeviceStateRequestPause;
+                entry->deviceState &= ~kPCIDeviceStateAllocated;
+                fWaitingPause--;
+            }
+            if (!(kPCIDeviceStatePaused & entry->deviceState))
+            {
+#if !ACPI_SUPPORT
+                // Prevent the device/bridge from initiating/forwarding memory or I/O requests
+                // during pause handling.
+                if (op == kConfigOpPaused)
+                {
+                    entry->pausedCommand = configRead16(entry, kIOPCIConfigCommand);
+                    configWrite16(entry, kIOPCIConfigCommand, entry->pausedCommand & ~kIOPCICommandBusLead);
+                    entry->commandSaved = true;
+                }
+#endif
+                entry->deviceState |= kPCIDeviceStatePaused;
+                if (fStates & kIOPCIConfiguratorMPSOverride)
+                {
+                    fStates |= kIOPCIConfiguratorMPSOverridePause;
+                }
+            }
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpUnpaused:
+            if (kPCIDeviceStatePaused & entry->deviceState)
+            {
+#if !ACPI_SUPPORT
+                if (entry->commandSaved)
+                {
+                    configWrite16(entry, kIOPCIConfigCommand, entry->pausedCommand);
+                    entry->commandSaved = false;
+                }
+#endif
+                entry->deviceState &= ~kPCIDeviceStatePaused;
+                if (fStates & kIOPCIConfiguratorMPSOverridePause)
+                {
+                    fStates &= ~kIOPCIConfiguratorMPSOverridePause;
+                }
+            }
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpTestPause:
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpScan:
+            if (kPCIDeviceStateScanned & entry->deviceState)
+            {
+                *((void **)arg) = NULL;
+                ret = kIOReturnSuccess;
+                return (ret);
+                break;
+            }
+
+            // always reset regs due to hotp interrupt clearing memory ranges
+            entry->rangeBaseChanges |= ((1 << kIOPCIRangeBridgeMemory)
+                                      |  (1 << kIOPCIRangeBridgePFMemory));
+
+            // fall thru
+
+        case kConfigOpRealloc:
+
+            fChangedServices = OSSet::withCapacity(8);
+            configure(0);
+
+            if (entry)
+            {
+                entry->deviceState &= ~kPCIDeviceStateLinkInt;
+            }
+
+            if (arg)
+            {
+                *((void **)arg) = fChangedServices;
+            }
+            else
+            {
+                fChangedServices->release();
+            }
+            fChangedServices = 0;
+            ret = kIOReturnSuccess;
+            return (ret);
+            break;
+
+
+        case kConfigOpEject:
+            entry->deviceState |= kPCIDeviceStateEjected;
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpKill:
+            entry->deviceState |= kPCIDeviceStateToKill;
+            ret = kIOReturnSuccess;
+            break;
+
+        case kConfigOpProtect:
+            entry->deviceState = (entry->deviceState & ~(kPCIDeviceStateConfigRProtect|kPCIDeviceStateConfigWProtect))
+                                | (*((uint32_t *) arg));
+
+
+            ret = kIOReturnSuccess;
+            break;
+    }
+
+    return (ret);
+}
+
+bool IOPCIConfigurator::bridgeConstructDeviceTree(void * unused, IOPCIConfigEntry * bridge)
+{
+    IORegistryEntry *   dtBridge = bridge->dtNub;
+    uint32_t            int32;
+    bool                ok = true;
+    VMDChildDevice       * nub;
+    OSDictionary      * initFrom;
+
+//    DLOG("bridgeConstructDeviceTree(%p)\n", bridge);
+    if (!dtBridge) return (ok);
+
+    int32 = 3;
+    dtBridge->setProperty("#address-cells", &int32, sizeof(int32));
+    int32 = 2;
+    dtBridge->setProperty("#size-cells", &int32, sizeof(int32));
+
+    // Create missing device-tree entries for any child devices.
+
+    FOREACH_CHILD( bridge, child )
+    {
+        VMDChildDevice     * pciDevice;
+        IORegistryEntry * copyReg;
+        OSDictionary    * propTable;
+        OSObject        * obj;
+        const OSSymbol  * sym;
+        bool              addProps;
+        bool              initDT;
+
+        if (kPCIDeviceStatePropertiesDone & child->deviceState) continue;
+        child->deviceState |= kPCIDeviceStatePropertiesDone;
+
+
+        propTable = constructProperties(child);
+        if (!propTable) continue;
+
+#if ACPI_SUPPORT
+        if (child->acpiDevice)
+        {
+            OSObject  *    obj;
+            OSDictionary * mergeProps;
+            obj = child->acpiDevice->copyProperty(kACPIDevicePropertiesKey);
+            if (obj)
+            {
+                if ((mergeProps = OSDynamicCast(OSDictionary, obj)))
+                    propTable->merge(mergeProps);
+                obj->release();
+            }
+        }
+#endif /* ACPI_SUPPORT */
+
+        pciDevice = OSDynamicCast(VMDChildDevice, child->dtNub);
+        addProps = true;
+        if (!pciDevice)
+        {
+            nub = OSTypeAlloc(VMDChildDevice);
+            if (!nub) continue;
+            initFrom = 0;
+            initDT = false;
+            ok = false;
+            if (child->dtEntry)
+            {
+#if ACPI_SUPPORT
+                ok = nub->init(child->dtEntry, gIODTPlane);
+                if (ok) child->deviceState |= kPCIDeviceStateAttached;
+                child->dtNub = child->dtEntry = 0;
+                initDT = true;
+#else  /* !ACPI_SUPPORT */
+                initFrom = child->dtEntry->dictionaryWithProperties();
+#endif /* !ACPI_SUPPORT */
+            }
+            if (!initDT)
+            {
+                if (!initFrom)
+                {
+                    initFrom = propTable;
+                    initFrom->retain();
+                    addProps = false;
+                }
+                ok = (nub->init(initFrom) && nub->attachToParent(dtBridge, gIODTPlane));
+                if (ok) child->deviceState |= kPCIDeviceStateAttached;
+                initFrom->release();
+            }
+            nub->release();
+            if (!ok) continue;
+            nub->reserved->configEntry = child;
+            nub->reserved->hostBridge = child->hostBridge;
+            nub->reserved->domainId = fDomainId;
+            child->dtNub = nub;
+#if ACPI_SUPPORT
+            child->dtEntry = nub;
+            copyReg = child->acpiDevice;
+#else /* !ACPI_SUPPORT */
+            copyReg = child->dtEntry;
+#endif /* !ACPI_SUPPORT */
+
+            if (child->dtEntry && (child->dtEntry != nub)) nub->setProperty(kIOPCIDeviceDeviceTreeEntryKey, child->dtEntry);
+            if (!initDT)
+            {
+                if (copyReg && !copyReg->propertyExists("pci-generate-name"))
+                {
+                    if ((sym = copyReg->copyName()))
+                    {
+                        nub->setName(sym);
+                        sym->release();
+                    }
+                }
+                else if ((sym = OSDynamicCast(OSSymbol, propTable->getObject(gIONameKey))))
+                    nub->setName(sym);
+            }
+        }
+
+        if (addProps)
+        {
+            // update existing device
+            OSCollectionIterator * propIter =
+                OSCollectionIterator::withCollection(propTable);
+            if (propIter)
+            {
+                const OSSymbol * propKey;
+
+                while ((propKey = (const OSSymbol *)propIter->getNextObject()))
+                {
+                    if (   !child->dtNub->getProperty(propKey)
+                        || (propKey->isEqualTo("name") && child->dtNub->propertyExists("pci-generate-name"))
+                        || (propKey->isEqualTo("ranges"))
+                        || (propKey->isEqualTo("reg"))
+                        || (propKey->isEqualTo("assigned-addresses"))
+                        || (propKey->isEqualTo("pcidebug")))
+                    {
+                        obj = propTable->getObject(propKey);
+                        child->dtNub->setProperty(propKey, obj);
+                    }
+                }
+                propIter->release();
+            }
+        }
+
+        if (pciDevice
+          && (kPCIDeviceStatePaused & child->deviceState)
+            && pciDevice->getProperty(kIOPCIResourcedKey))
+        {
+            // relocate existing device
+            for (uint32_t idx = 0; idx < kIOPCIRangeCount; idx++)
+            {
+                IOPCIRange * range;
+                range = child->ranges[idx];
+                if (!range)    continue;
+
+            }
+            pciDevice->relocate(false);
+        }
+        propTable->release();
+    }
+    dtBridge->setProperty(kIOPCIConfiguredKey, kOSBooleanTrue);
+
+    return (ok);
+}
+
+IOReturn IOPCIBridge::configOp(configOpParams *params)
+{
+    IOReturn       ret = kIOReturnSuccess;
+    IOPCIDevice   *probeDevice = nullptr;
+    OSSet *        changed = nullptr;
+    IOPCIDevice *  next = nullptr;
+    uint32_t       state;
+    IOPCIHostBridgeData *vars = reserved->hostBridgeData;
+
+    if (params->op == kConfigOpPaused)
+    {
+        probeDevice = OSDynamicCast(IOPCIDevice, params->device);
+        assert(probeDevice);
+    }
+
+    // Make sure we are running in gate.
+    if (!vars->_configWorkLoop->inGate())
+    {
+        return (vars->_configWorkLoop->runAction(
+                        OSMemberFunctionCast(IOCommandGate::Action, this, &IOPCIBridge::configOp),
+                        this, params));
+    }
+    
+    if (kConfigOpScan != params->op)
+    {
+        ret = vars->_configurator->configOp(params->device, params->op, params->result, params->arg);
+        if (kIOReturnSuccess != ret) return (ret);
+
+        next = (IOPCIDevice *) params->device;
+        if (kConfigOpTerminated == params->op)
+        {
+            vars->_waitingPauseSet->removeObject(next);
+            vars->_pausedSet->removeObject(next);
+            vars->_probeSet->removeObject(next);
+            vars->_publishSet->removeObject(next);
+        }
+        else if (kConfigOpTestPause == params->op)
+        {
+            if (vars->_waitingPauseSet->setObject(next))
+            {
+                next->changePowerStateToPriv(kIOPCIDevicePausedState);
+                next->powerOverrideOnPriv();
+            }
+        }
+        else if (kConfigOpUnpaused == params->op)
+        {
+            vars->_pausedSet->removeObject(next);
+        }
+
+        if (params->op != kConfigOpPaused)
+        {
+            params->op = 0;
+        }
+        else
+        {
+            params->op = 0;
+
+            if (vars->_waitingPauseSet->containsObject(params->device))
+            {
+                vars->_pausedSet->setObject(params->device);
+                vars->_waitingPauseSet->removeObject(params->device);
+                if (!vars->_waitingPauseSet->getCount())
+                {
+                    params->op = kConfigOpRealloc;
+                }
+            }
+        }
+    }
+
+    while (params->op)
+    {
+        ret = vars->_configurator->configOp(params->device, params->op, &changed);
+        params->op = 0;
+        if (kIOReturnSuccess != ret) break;
+        if (!changed) break;
+
+        while ((next = (IOPCIDevice *) changed->getAnyObject()))
+        {
+            ret = vars->_configurator->configOp(next, kConfigOpGetState, &state);
+            if (kIOReturnSuccess == ret)
+            {
+                if (kPCIDeviceStateDead & state)
+                {
+                    next->terminate();
+                }
+                else if (kPCIDeviceStateRequestPause & state)
+                {
+                    if (vars->_waitingPauseSet->setObject(next))
+                    {
+                        // initiatePause() starts the pause IOPM transition if the nub and its children have
+                        // finished initializing, else it defers the transition for (at least) another 100ms.
+                        next->initiatePause();
+                    }
+                }
+                else
+                {
+                    vars->_probeSet->setObject(next);
+                }
+            }
+            changed->removeObject(next);
+        }
+        changed->release();
+    }
+
+    if (!vars->_waitingPauseSet->getCount())
+    {
+        vars->_pausedSet->iterateObjects(^bool(OSObject *object)
+        {
+            IOPCIDevice *next = OSDynamicCast(IOPCIDevice, object);
+            if (2 != next->reserved->pauseFlags)
+            {
+                next->changePowerStateToPriv(kIOPCIDeviceOnState);
+                next->powerOverrideOffPriv();
+            }
+            next->reserved->pauseFlags = 0;
+            return false;
+        });
+        while ((next = (IOPCIDevice *) vars->_probeSet->getAnyObject()))
+        {
+            vars->_publishSet->setObject(next);
+            if (kIOPCIDeviceOnState == next->reserved->pciPMState && next != probeDevice) deferredProbe(next);
+            else                                     next->reserved->needsProbe = true;
+            vars->_probeSet->removeObject(next);
+        }
+    }
+
+    return (ret);
 }

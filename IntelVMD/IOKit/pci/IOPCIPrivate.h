@@ -45,9 +45,12 @@ class IOPCIHostBridge;
 #include <IOKit/IOInterruptController.h>
 #include <libkern/OSDebug.h>
 #include <IOKit/IOUserClient.h>
-#include "../../IOKit/pci/IOPCIConfigurator.h"
+#include <IOKit/pci/IOPCIConfigurator.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOLib.h>
+#include <os/log.h>
+#include <IOKit/pci/IOPCITraceEventBuffer.h>
 
 enum
 {
