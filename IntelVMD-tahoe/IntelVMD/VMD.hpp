@@ -366,7 +366,7 @@ public:
     volatile UInt32 *rmmioPtr {nullptr};
     uint32_t fVmdVector {0xFFFFFFFF};
     
-    
+    /*
     virtual IOReturn configureInterrupts(UInt32 interruptType,
                                          UInt32 numRequired,
                                          UInt32 numRequested,
@@ -374,7 +374,7 @@ public:
     virtual IOReturn registerInterrupt(int source, OSObject *target,
                                        IOInterruptAction handler,
                                        void *refCon = 0) override;
-    
+    */
     virtual UInt32 configRead32( IOPCIAddressSpace space, UInt8 offset ) override;
     virtual void configWrite32( IOPCIAddressSpace space,
                                UInt8 offset, UInt32 data ) override;

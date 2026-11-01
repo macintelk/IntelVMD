@@ -819,7 +819,6 @@ bool VMDDriver::vmdProbe(IOService *provider)
     fPCIDev->setMemoryEnable(true);
     fPCIDev->setBusMasterEnable(true);
 
-    // vmd_ids[] match (informational — Info.plist already gated matching)
     uint16_t deviceId = fPCIDev->configRead16(kIOPCIConfigDeviceID);
     const VMDDeviceEntry *ent = vmdLookupDevice(deviceId);
     fFeatures = ent ? ent->features : 0;
@@ -879,19 +878,14 @@ bool VMDDriver::vmdProbe(IOService *provider)
     //           messaged-interrupt controller owns them end to end (Linux
     //           creates no irq_domain at all for CAN_BYPASS devices).
     //
-    // The configurator scan builds stock IOPCIDevice nubs (OSTypeAlloc in
-    // IOPCIConfigurator.cpp — createNub() is never called on this path), so
-    // the VMDChildDevice demux hooks cannot run: bypass is the only model
-    // that delivers interrupts through 100% stock paths.  Default follows
-    // the Linux feature table; force per-boot with an OSBoolean/OSData
-    // property on the VMD device: "VMD-Force-Bypass" / "VMD-Force-Demux".
-    fDemuxMode = !(fFeatures & VMD_FEAT_CAN_BYPASS_MSI_REMAP);
 
+    fDemuxMode = !(fFeatures & VMD_FEAT_CAN_BYPASS_MSI_REMAP);
+    fDemuxMode =false;
+    
     fPCIDev->setProperty("VMD-MSI-Model", fDemuxMode ? "demux" : "bypass");
 
-    if (fDemuxMode) {
-        if (!setupMSIX()) return false;
-    }
+    if (!setupMSIX()) return false;
+    
     setMSIRemapping(fDemuxMode);
 
     // pci_create_root_bus(..., vmd->busn_start, ...): the "bridge space" is
@@ -2158,24 +2152,6 @@ void VMDDriver::wireChildMSI(IOPCIDevice *nub)
 
 void VMDDriver::composeChildMSI(IOPCIDevice *nub)
 {
-    if (!nub) return;
-
-
-    if (!fDemuxMode) {
-        nub->setProperty("VMD-MSI-Model", "bypass-stock");
-        return;
-    }
-    if (!fPCIDev) {
-        nub->setProperty("VMD-MSI-NoVmdDev", true);
-        return;
-    }
-    if (!fMsixCount) {
-        nub->setProperty("VMD-MSI-NoMsixTable", true);
-        return;
-    }
-
-    // ---- vector allocation (Linux vmd_next_irq) ------------------------
-    uint32_t cls = nub->configRead32(kIOPCIConfigRevisionID) >> 16;
 
     OSNumber *vecProp =
         OSDynamicCast(OSNumber, nub->getProperty("VMD-MSI-Vec"));
@@ -2189,6 +2165,9 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
         }
         nub->setProperty("VMD-MSI-Vec", nv, 32);
         vecProp = OSDynamicCast(OSNumber, nub->getProperty("VMD-MSI-Vec"));
+        VMDChildDevice *cc=OSDynamicCast(VMDChildDevice, nub);
+        cc->fVmdVector=vecProp->unsigned32BitValue();
+        
     }
     uint32_t vec    = vecProp ? vecProp->unsigned32BitValue() : fFirstVec;
     uint32_t addrLo = X86_MSI_BASE_ADDRESS_LOW  | (vec << X86_MSI_DESTID_SHIFT);
@@ -2206,10 +2185,7 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
         && nub->findPCICapability(kIOPCICapabilityIDMSI, &cap) && cap) {
         uint16_t ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
         nub->setProperty("VMD-MSI-Mode", "MSI");
-        if (((ctrl & PCI_MSI_FLAGS_ENABLE) == 0) && (cls == VMD_CLASS_NVME)) {
-            // No messaged interrupt was ever enabled on the device (stock
-            // configureInterrupts() failed or was never run) — a disabled
-            // MSI block can never fire.  Enable it ourselves.
+        if (((ctrl & PCI_MSI_FLAGS_ENABLE) == 0)) {
             ctrl |= PCI_MSI_FLAGS_ENABLE;
             nub->configWrite16(cap + PCI_MSI_FLAGS, ctrl);
             ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
@@ -2237,11 +2213,7 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
         uint16_t ctrl = nub->configRead16(cap + PCI_MSIX_FLAGS);
         nub->setProperty("VMD-MSI-Mode", "MSI-X");
         nub->setProperty("VMD-MSI-Ctrl", ctrl, 16);
-        if (((ctrl & PCI_MSIX_FLAGS_ENABLE) == 0) && (cls == VMD_CLASS_NVME)) {
-            // Stock configureInterrupts() left MSI-X disabled (or never
-            // succeeded).  A disabled MSI-X block can never fire, so enable
-            // it for the NVMe endpoint ourselves.  Per the PCI local bus
-            // spec MSI Enable must be clear while MSI-X is enabled.
+        if (((ctrl & PCI_MSIX_FLAGS_ENABLE) == 0)) {
             uint8_t msiCap = 0;
             if (nub->findPCICapability(kIOPCICapabilityIDMSI, &msiCap)
                 && msiCap) {
@@ -2507,18 +2479,16 @@ bool VMDChildDevice::handleOpen(IOService * forClient, IOOptionBits options, voi
 
 
 
-
+/*
 IOReturn VMDChildDevice::configureInterrupts(UInt32 interruptType,
                                              UInt32 numRequired,
                                              UInt32 numRequested,
                                              IOOptionBits options)
 {
-    IOReturn ret = IOPCIDevice::configureInterrupts(interruptType,
-                                                    numRequired,
-                                                    numRequested, options);
-    setProperty("VMD-MSI-AppleCfg-Type", interruptType, 32);
-    setProperty("VMD-MSI-AppleCfg-Stat", ret, 32);
-    if (pvmd) pvmd->composeChildMSI(this);
+    IOReturn ret = IOPCIDevice::configureInterrupts(interruptType,numRequired,numRequested, options);
+    setProperty("VMD-MSI-configureInterrupts-Type", interruptType, 32);
+    setProperty("VMD-MSI-configureInterrupts-Stat", ret, 32);
+
     return ret;
 }
 
@@ -2526,28 +2496,12 @@ IOReturn VMDChildDevice::registerInterrupt(int source, OSObject *target,
                                            IOInterruptAction handler,
                                            void *refCon)
 {
-    IOReturn ret = IOPCIDevice::registerInterrupt(source, target, handler,
-                                                  refCon);
-    setProperty("VMD-MSI-AppleReg-Stat", ret, 32);
+    IOReturn ret = IOPCIDevice::registerInterrupt(source, target, handler,refCon);
+    setProperty("VMD-MSI-registerInterrupt-Stat", ret, 32);
 
-
-    IOPCIDevice *vdev = pvmd ? pvmd->vmdDevice() : NULL;
-    if (vdev && fVmdVector != 0xFFFFFFFFU) {
-        IOReturn r = vdev->registerInterrupt((int)fVmdVector, target,
-                                             handler, refCon);
-        if (r == kIOReturnSuccess) {
-            vdev->enableInterrupt((int)fVmdVector);
-            setProperty("VMD-MSI-Direct", fVmdVector, 32);
-            if (ret != kIOReturnSuccess)
-                ret = kIOReturnSuccess;
-        }
-        setProperty("VMD-MSI-Direct-Stat", r, 32);
-    }
-
-    //if (pvmd) pvmd->composeChildMSI(this);// msi-x only
     return ret;
 }
-
+*/
 
 void IOPCIConfigurator::doConfigure(uint32_t options)
 {
