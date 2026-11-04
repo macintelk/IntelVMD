@@ -362,8 +362,6 @@ class VMDChildDevice : public IOPCIDevice
     
 public:
     
-    IOMemoryMap *rmmio {nullptr};
-    volatile UInt32 *rmmioPtr {nullptr};
     uint32_t fVmdVector {0xFFFFFFFF};
     
     /*

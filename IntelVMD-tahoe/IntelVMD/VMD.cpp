@@ -651,8 +651,9 @@ void VMDDriver::configure1( IOService * provider )
     
     if (!pciDevice) return;
     
+    pciDevice->setMemoryEnable(true);
     uint16_t reg0;
-    uint16_t busStart,busEnd;
+    uint16_t busStart=0,busEnd=0xFF;
     
     reg0=pciDevice->configRead16(   PCI_REG_VMCAP);
     if (BUS_RESTRICT_CAP(reg0)) {
@@ -673,12 +674,15 @@ void VMDDriver::configure1( IOService * provider )
         }
     }
     
-    busEnd=0xFF;
-    
+    pciDevice->setMemoryEnable(false);
     pciDevice->configWrite32(kIOPCIConfigBaseAddress0,  0);
     pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03100000);
     //pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03102000);
 
+    pciDevice->setMemoryEnable(true);
+    UInt64 addressnew=    (UInt64)pciDevice->configRead32(kIOPCIConfigBaseAddress1) << 32;
+    
+    
     IOPCIAddressSpace space;
     space.s.busNum = busStart;
     
@@ -739,7 +743,7 @@ void VMDDriver::configure1( IOService * provider )
     
     IODeviceMemory::InitElement rangeList[3];
     
-    address=0x6000000000;
+    address=addressnew;//0x6000000000;
     length=0x2000000;
     addrSpace.s.space=kIOPCI64BitMemorySpace;
     addrSpace.s.registerNum=0x10;
@@ -756,7 +760,7 @@ void VMDDriver::configure1( IOService * provider )
         .tag = addrSpace.bits
     };
     
-    address=0x50000000;
+    address=pciDevice->configRead32(kIOPCIConfigBaseAddress2);//0x50000000;
     length=0x2000000;
     addrSpace.s.space=kIOPCI32BitMemorySpace;
     addrSpace.s.registerNum=0x18;
@@ -773,7 +777,7 @@ void VMDDriver::configure1( IOService * provider )
         .tag = addrSpace.bits
     };
     
-    address=0x6003100000;
+    address=addressnew+0x03100000;//0x6003100000;
     length=0x100000;
      //address=0x6003100000+0x2000;
      //length=0x100000-0x2000;
@@ -941,8 +945,8 @@ bool VMDDriver::decodeAndPublishBars(void)
     
     fCfgMap = fPCIDev->mapDeviceMemoryWithIndex(0);
     
-    fMap1= fPCIDev->mapDeviceMemoryWithIndex(2);
-    fMap2= fPCIDev->mapDeviceMemoryWithIndex(4);
+    //fMap1= fPCIDev->mapDeviceMemoryWithIndex(2);
+    //fMap2= fPCIDev->mapDeviceMemoryWithIndex(4);
     
     if (!fCfgMap) {
         IOLog("IntelVMD: cannot map CFGBAR\n");
@@ -955,10 +959,15 @@ bool VMDDriver::decodeAndPublishBars(void)
 bool VMDDriver::start(IOService *provider)
 {
     pvmd=this;
+    
     if (!vmdProbe(provider)) {
         IOLog("IntelVMD: probe failed\n");
         return false;
     }
+    
+    //fPCIDev->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
+    //fPCIDev->setPowerState(kIOPCIDeviceOnState, this);
+    
     fPCIDev->setProperty("VMD-Stage-Probe", true);
     if (!seedBridgeEntry()) {
         IOLog("IntelVMD: cannot seed the bridge config entry\n");
@@ -966,10 +975,6 @@ bool VMDDriver::start(IOService *provider)
     }
     fPCIDev->setProperty("VMD-Stage-Seed", true);
 
-    fPCIDev->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
-    fPCIDev->setPowerState(kIOPCIDeviceOnState, this);
-    IOSleep(10);
-    
     bool ok = IOPCI2PCIBridge::start(provider);
     if (!ok) {
         IOLog("IntelVMD: IOPCI2PCIBridge::start failed\n");
@@ -983,7 +988,7 @@ bool VMDDriver::start(IOService *provider)
     cp.op     = kConfigOpScan;
     cp.result = NULL;
     configOp(&cp);
-
+    
     // scan census: how many entries the configurator hung off the root
     // complex.  0 means the scan found nothing — check the ECAM accessors.
     uint32_t scanKids = 0;
@@ -997,7 +1002,7 @@ bool VMDDriver::start(IOService *provider)
     // last-moment decode re-assert before driver matching begins: anything
     // between postScanConfigure() and matching (family bridge init,
     // checkLink on power paths) may have zeroed the windows again.
-    vmdReassertAll();
+    //vmdReassertAll();
     fPCIDev->setProperty("VMD-Stage-PreRegister-Reassert", true);
 
     registerService();
@@ -1615,7 +1620,7 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
         return;
     }
 
-    nub->retain();
+    //nub->retain();
     //nub->open(this);
     
     // 1. ACPI companion (vmd_acpi_find_companion)
@@ -1912,14 +1917,10 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
     // Reuse the mapping stabilizeNVMeForCAP() stashed on the nub when it
     // ran; only map here if there is none yet.
     IOMemoryMap *bar0 = NULL;
-    if (child && child->rmmio) {
-        bar0 = child->rmmio;
-        stashed = true;
-    } else {
         bar0 = nub2->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0,
                                                  kIOMapInhibitCache
                                                  | kIOMapAnywhere);
-    }
+
     if (!bar0) {
         // InitializePCI() would fail: no map -> "( 0 != fBaseAddress )"
         nub2->setProperty("VMD-Dbg-BAR0-Valid", false);
@@ -1935,13 +1936,6 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
     volatile UInt8 *mmio = (volatile UInt8 *)bar0->getVirtualAddress();
     if (!mmio) {
         return;
-    }
-
-
-    if (child && !child->rmmio) {
-        child->rmmio    = bar0;
-        child->rmmioPtr = (volatile UInt32 *)mmio;
-        stashed = true;
     }
 
     
@@ -2015,7 +2009,7 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
         nub2->setProperty("VMD-Dbg-APL-InitOK", capOK && cssOK && mpsOK && vsOK);
     }
     
-    if (!stashed) bar0->release();
+    bar0->release();
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -2391,11 +2385,11 @@ void VMDDriver::free(void)
         fVmdWorkLoop->release();
         fVmdWorkLoop = NULL;
     }
-    if (fPCIDev) {
+   /* if (fPCIDev) {
         fPCIDev->close(this);
         fPCIDev->release();
         fPCIDev = NULL;
-    }
+    }*/
     // stock IOPCIFamily cleanup (binds to the IOPCIFamily export — this
     // kext does not define IOPCI2PCIBridge::free)
     IOPCI2PCIBridge::free();
@@ -2444,13 +2438,7 @@ IOWorkLoop * VMDChildDevice::getWorkLoop(void) const
 
 void VMDChildDevice::free(void)
 {
-    // appleNVMeInitDebug() stashes its BAR0 debug mapping here; release it
-    // so the probe does not leak the IOMemoryMap when the nub is torn down.
-    if (rmmio) {
-        rmmio->release();
-        rmmio = NULL;
-    }
-    rmmioPtr = NULL;
+
     IOService::free();
 }
 
