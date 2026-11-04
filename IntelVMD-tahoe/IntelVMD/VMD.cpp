@@ -1123,13 +1123,20 @@ bool VMDDriver::seedBridgeEntry(void)
     IOACPIPlatformDevice *selfAcpi = VMDACPIDevice(bridge->acpiDevice);
     if (!selfAcpi)
         selfAcpi = VMDACPIDevice(fPCIDev->getProperty("acpi-device"));
-    if (selfAcpi) {
+    if (selfAcpi && bridge->dtEntry) {
         char path[512];
         bzero(path, sizeof(path));
         int s=sizeof(path);
-        if (selfAcpi->getPath(path, &s, gIOServicePlane) && path[0])
-            bridge->dtEntry->setProperty(kACPIDevicePathKey,
-                                         OSString::withCString(path));
+        if (selfAcpi->getPath(path, &s, gIOServicePlane) && path[0]) {
+            /* Memory leak fix: withCString() returns a retained string and
+             * setProperty() takes its own reference — the old inline form
+             * orphaned the withCString() reference on every boot. */
+            OSString *pathStr = OSString::withCString(path);
+            if (pathStr) {
+                bridge->dtEntry->setProperty(kACPIDevicePathKey, pathStr);
+                pathStr->release();
+            }
+        }
         bridge->dtEntry->setProperty("acpi-device", selfAcpi);
     }
 
@@ -1161,8 +1168,9 @@ bool VMDDriver::seedBridgeEntry(void)
     // Save the VMD device's config registers into the IOPCIFamily shadow
     // (used by saveDeviceState/restoreDeviceState across sleep).
     IOPCIConfigShadow *shadow = configShadow(fPCIDev);
-    for (int i = 0; i < kIOPCIConfigEPShadowRegs; i++)
-        shadow->configSave.savedConfig[i] = fPCIDev->configRead32(i * 4);
+    if (shadow)                              // safety fix: was deref'd unchecked
+        for (int i = 0; i < kIOPCIConfigEPShadowRegs; i++)
+            shadow->configSave.savedConfig[i] = fPCIDev->configRead32(i * 4);
 
     return true;
 }
@@ -1935,6 +1943,9 @@ void VMDDriver::appleNVMeInitDebug(IOPCIDevice *nub2)
 
     volatile UInt8 *mmio = (volatile UInt8 *)bar0->getVirtualAddress();
     if (!mmio) {
+        /* Memory leak fix: this early return used to skip bar0->release()
+         * below, leaking the BAR0 IOMemoryMap. */
+        bar0->release();
         return;
     }
 
@@ -2097,8 +2108,14 @@ void VMDDriver::associateACPI(IOPCIConfigEntry *entry, IOPCIDevice *inheritFrom)
         bzero(path, sizeof(path));
         int s=sizeof(path);
         if (acpiDev->getPath(path, &s, gIOServicePlane) && path[0]) {
-            entry->dtNub->setProperty(kACPIDevicePathKey,
-                                      OSString::withCString(path));
+            /* Memory leak fix: withCString() returns a retained string and
+             * setProperty() takes its own reference — release ours after
+             * publishing. */
+            OSString *pathStr = OSString::withCString(path);
+            if (pathStr) {
+                entry->dtNub->setProperty(kACPIDevicePathKey, pathStr);
+                pathStr->release();
+            }
         } else {
             OSObject *prop = acpiDev->getProperty(kACPIDevicePathKey);
             if (prop) entry->dtNub->setProperty(kACPIDevicePathKey, prop);
@@ -2159,8 +2176,10 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
         }
         nub->setProperty("VMD-MSI-Vec", nv, 32);
         vecProp = OSDynamicCast(OSNumber, nub->getProperty("VMD-MSI-Vec"));
-        VMDChildDevice *cc=OSDynamicCast(VMDChildDevice, nub);
-        cc->fVmdVector=vecProp->unsigned32BitValue();
+        VMDChildDevice *cc = OSDynamicCast(VMDChildDevice, nub);
+        /* Safety fix: both lookups can fail — do not dereference blindly. */
+        if (cc && vecProp)
+            cc->fVmdVector = vecProp->unsigned32BitValue();
         
     }
     uint32_t vec    = vecProp ? vecProp->unsigned32BitValue() : fFirstVec;
@@ -2385,13 +2404,13 @@ void VMDDriver::free(void)
         fVmdWorkLoop->release();
         fVmdWorkLoop = NULL;
     }
-   /* if (fPCIDev) {
+
+    if (fPCIDev) {
         fPCIDev->close(this);
         fPCIDev->release();
         fPCIDev = NULL;
-    }*/
-    // stock IOPCIFamily cleanup (binds to the IOPCIFamily export — this
-    // kext does not define IOPCI2PCIBridge::free)
+    }
+
     IOPCI2PCIBridge::free();
 }
 
@@ -2439,7 +2458,7 @@ IOWorkLoop * VMDChildDevice::getWorkLoop(void) const
 void VMDChildDevice::free(void)
 {
 
-    IOService::free();
+    IOPCIDevice::free();
 }
 
 
