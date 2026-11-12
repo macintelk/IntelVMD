@@ -4,6 +4,7 @@
 
 #include <libkern/libkern.h>   /* snprintf (Apple's SetNVMeProperties uses it) */
 #include <kern/clock.h>        /* Uptime stamps for the demux trace */
+#include <pexpert/pexpert.h>   /* PE_parse_boot_argn (vmdaspm opt-in) */
 
 /* Exported by com.apple.kpi.libkern (Libkern.exports); declared
  * here in case the SDK header set does not expose machine_routines.h. */
@@ -1789,6 +1790,394 @@ void VMDDriver::configureChildDevice(IOPCIConfigEntry *entry,
 }
 
 
+/* Opt-in link power management behind VMD.
+ *
+ * The BIOS leaves ASPM and LTR off on links behind VMD (both LNKCTL = 0x40
+ * on the test laptop) and the driver clears ASPM explicitly during bring-up.  Linux
+ * re-enables link PM for client VMD (vmd_pm_enable_quirk ->
+ * pci_enable_link_state_locked(PCIE_LINK_STATE_ALL)) because otherwise the
+ * package cannot reach deep C-states.
+ *
+ * boot-arg vmdaspm=<mask>; absent, 0, or not a number 0..7 = default
+ * behaviour (one PE_parse_boot_argn and one setProperty, nothing written).
+ * A bare "vmdaspm" (no '=') parses as 1.
+ *   bit0  ASPM L1 on both partners, only when both LNKCAPs advertise L1 and
+ *         the L1 exit latency fits the endpoint's DEVCAP L1 acceptable
+ *         latency (Linux pcie_aspm_check_latency).  L0s is never enabled.
+ *   bit1  endpoint Clock PM (LNKCTL.ECPM, CLKREQ#) when LNKCAP.CPM is set.
+ *   bit2  (with bit0) LTR_EN on the path (root port first) and ASPM
+ *         L1.1/L1.2 through the L1 PM Substates capability, programmed while
+ *         ASPM L1 is off, in the order and with the T_POWER_ON /
+ *         Common_Mode_Restore / LTR_L1.2_THRESHOLD values of Linux
+ *         aspm_calc_l12_info() + pcie_config_aspm_l1ss().  L1.2 only with
+ *         LTR on both ends; PCI-PM L1.x bits stay off.  Before LTR_EN
+ *         the endpoint's LTR max snoop/no-snoop latency is set to the
+ *         Linux vmd_pm_enable_quirk value when it still reads 0 (in case
+ *         enableLTRQuirk() did not program it); without a usable LTR
+ *         max, LTR_EN and L1.2 stay off.  bit0 without
+ *         bit2 clears any L1.x enable the firmware left set (plain L1).
+ *   vmdaspm=4 (bit2 alone) writes nothing: a read-only probe that
+ *         publishes LNKCAP/DEVCAP/DEVCAP2/LNKCTL/L1SS/LTR/AER snapshots.
+ * Every read-modify-write refuses an all-ones read.
+ * Only an NVMe function directly below a Root Port is touched.  ASPM L1 is
+ * disabled endpoint first and enabled root port first (PCIe 7.5.3.7).
+ * Runs after the DLLLA wait and the NVMe bring-up probes.  Every value read
+ * or written is published as VMD-LinkPM-* on the endpoint nub; snapshots
+ * "Pre"/"Set" here and "Open"/"Close" when IONVMe opens/closes the nub
+ * (opt-in only).  Extended registers go through the VMD's own config
+ * accessors exactly like enableLTRQuirk(). */
+static uint32_t gVmdLinkPMMask = 0;   // non-zero only once the opt-in acted
+
+#define VMD_EXT_CAP_AER   0x0001
+#define VMD_EXT_CAP_L1SS  0x001E
+#define VMD_L1SS_CAP      0x04
+#define VMD_L1SS_CTL1     0x08
+#define VMD_L1SS_CTL2     0x0C
+
+static IOPCIAddressSpace vmdExtSpace(IOPCIDevice *d, uint32_t pos)
+{
+    IOPCIAddressSpace es = d->space;
+    es.bits &= ~0x0F000000;
+    es.es.registerNumExtended = (pos >> 8) & 0xF;
+    return es;
+}
+
+static uint32_t vmdExtRead32(VMDDriver *v, IOPCIDevice *d, uint32_t pos)
+{
+    return v->configRead32(vmdExtSpace(d, pos), (UInt8)(pos & 0xFF));
+}
+
+static void vmdExtWrite32(VMDDriver *v, IOPCIDevice *d, uint32_t pos, uint32_t val)
+{
+    v->configWrite32(vmdExtSpace(d, pos), (UInt8)(pos & 0xFF), val);
+}
+
+/* Walk only the extended chain (0x100..0xFFF).  VMDDriver's finder searches
+ * the standard list first, where AER's extended ID 0x0001 would match the
+ * standard PM capability ID 0x01. */
+static uint32_t vmdExtFind(VMDDriver *v, IOPCIDevice *d, uint32_t id)
+{
+    uint32_t off = 0x100;
+    for (int n = 0; off && n < 64; n++) {
+        const uint32_t hdr = vmdExtRead32(v, d, off);
+        if (hdr == 0 || hdr == 0xFFFFFFFFu) return 0;
+        if ((hdr & 0xFFFF) == id) return off;
+        off = (hdr >> 20) & 0xFFF;
+        if (off < 0x100 || (off & 3)) return 0;
+    }
+    return 0;
+}
+
+/* Read-modify-write of a 16-bit standard register through the nub; refuses
+ * an all-ones read so a failed access can never be written back as 0xFFFx
+ * (on a Root Port LNKCTL that sets Link Disable + Retrain Link). */
+static bool vmdRmw16(IOPCIDevice *d, uint32_t off, UInt16 clr, UInt16 set)
+{
+    const UInt16 cur = d->configRead16(off);
+    if (cur == 0xFFFF) return false;
+    d->configWrite16(off, (UInt16)((cur & ~clr) | set));
+    return true;
+}
+
+static void vmdLinkPMSnapshot(VMDDriver *v, IOPCIDevice *rp, IOPCIDevice *ep, const char *tag)
+{
+    if (!v || !rp || !ep) return;
+    char key[64];
+    UInt8 rc = 0, ec = 0;
+    if (rp->findPCICapability(kIOPCIPCIExpressCapability, &rc) && rc) {
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-LNKCTL", tag);
+        ep->setProperty(key, (unsigned long long)rp->configRead16(rc + 0x10), 16);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-DEVCTL2", tag);
+        ep->setProperty(key, (unsigned long long)rp->configRead16(rc + 0x28), 16);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-DEVCAP2", tag);
+        ep->setProperty(key, (unsigned long long)rp->configRead32(rc + 0x24), 32);
+    }
+    if (ep->findPCICapability(kIOPCIPCIExpressCapability, &ec) && ec) {
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-LNKCTL", tag);
+        ep->setProperty(key, (unsigned long long)ep->configRead16(ec + 0x10), 16);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-LNKSTA", tag);
+        ep->setProperty(key, (unsigned long long)ep->configRead16(ec + 0x12), 16);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-DEVCTL2", tag);
+        ep->setProperty(key, (unsigned long long)ep->configRead16(ec + 0x28), 16);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-DEVCAP2", tag);
+        ep->setProperty(key, (unsigned long long)ep->configRead32(ec + 0x24), 32);
+    }
+    uint32_t a;
+    if ((a = vmdExtFind(v, rp, VMD_EXT_CAP_AER))) {
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-AER-UNC", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, rp, a + 0x04), 32);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-AER-COR", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, rp, a + 0x10), 32);
+    }
+    if ((a = vmdExtFind(v, ep, VMD_EXT_CAP_AER))) {
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-AER-UNC", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, ep, a + 0x04), 32);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-AER-COR", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, ep, a + 0x10), 32);
+    }
+    if ((a = vmdExtFind(v, rp, VMD_EXT_CAP_L1SS))) {
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-L1SSCAP", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, rp, a + VMD_L1SS_CAP), 32);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-L1SSCTL1", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, rp, a + VMD_L1SS_CTL1), 32);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-RP-L1SSCTL2", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, rp, a + VMD_L1SS_CTL2), 32);
+    }
+    if ((a = vmdExtFind(v, ep, VMD_EXT_CAP_L1SS))) {
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-L1SSCAP", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, ep, a + VMD_L1SS_CAP), 32);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-L1SSCTL1", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, ep, a + VMD_L1SS_CTL1), 32);
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-L1SSCTL2", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, ep, a + VMD_L1SS_CTL2), 32);
+    }
+    if ((a = vmdExtFind(v, ep, 0x0018))) {           // LTR ext cap: max snoop/no-snoop
+        snprintf(key, sizeof(key), "VMD-LinkPM-%s-EP-LTRMAX", tag);
+        ep->setProperty(key, (unsigned long long)vmdExtRead32(v, ep, a + 0x04), 32);
+    }
+}
+
+/* Linux calc_l12_pwron(): T_POWER_ON in us; scale 3 is invalid -> 0. */
+static uint32_t vmdL12PwrOnUs(uint32_t cap)
+{
+    static const uint32_t unit[4] = { 2, 10, 100, 0 };
+    return ((cap >> 19) & 0x1F) * unit[(cap >> 16) & 3];
+}
+
+/* Linux encode_l12_threshold(). */
+static void vmdEncodeL12Th(uint32_t us, uint32_t *scale, uint32_t *value)
+{
+    static const uint64_t m[6] = { 1, 32, 1024, 32768, 1048576, 33554432 };
+    const uint64_t ns = (uint64_t)us * 1000;
+    for (uint32_t s = 0; s < 6; s++) {
+        if (ns <= m[s] * 0x3FF) {
+            *scale = s;
+            *value = (uint32_t)((ns + m[s] - 1) / m[s]);
+            return;
+        }
+    }
+    *scale = 5;
+    *value = 0x3FF;
+}
+
+/* bit2: called with ASPM L1 OFF on both partners.  Returns 4 if any ASPM
+ * L1.x was enabled. */
+static uint32_t vmdEnableL1SS(VMDDriver *v, IOPCIDevice *rp, IOPCIDevice *ep, UInt8 rc, UInt8 ec)
+{
+    const uint32_t rs = vmdExtFind(v, rp, VMD_EXT_CAP_L1SS);
+    const uint32_t es = vmdExtFind(v, ep, VMD_EXT_CAP_L1SS);
+    if (!rs || !es) {
+        ep->setProperty("VMD-LinkPM-L1SS-Skipped", "no L1 PM Substates capability");
+        return 0;
+    }
+    uint32_t rcap = vmdExtRead32(v, rp, rs + VMD_L1SS_CAP);
+    uint32_t ecap = vmdExtRead32(v, ep, es + VMD_L1SS_CAP);
+    ep->setProperty("VMD-LinkPM-RP-L1SSCAP", (unsigned long long)rcap, 32);
+    ep->setProperty("VMD-LinkPM-EP-L1SSCAP", (unsigned long long)ecap, 32);
+    if (rcap == 0xFFFFFFFFu || ecap == 0xFFFFFFFFu) {
+        ep->setProperty("VMD-LinkPM-L1SS-Skipped", "config read all-ones");
+        return 0;
+    }
+    if (!(rcap & 0x10)) rcap = 0;                    // L1 PM Substates Supported
+    if (!(ecap & 0x10)) ecap = 0;
+
+    // LTR on the whole path, root port first (Linux pci_configure_ltr).
+    // DEVCAP2/DEVCTL2 exist from PCIe capability version 2 on (Apple's
+    // IOPCIDevice::enableLTR checks expressV2 too); an all-ones read never
+    // counts as "supported" or "enabled".
+    const uint32_t rdc2 = ((rp->configRead16(rc + 0x02) & 0xF) >= 2) ? rp->configRead32(rc + 0x24) : 0;
+    const uint32_t edc2 = ((ep->configRead16(ec + 0x02) & 0xF) >= 2) ? ep->configRead32(ec + 0x24) : 0;
+    const bool ltrCap = (rdc2 != 0xFFFFFFFFu) && (edc2 != 0xFFFFFFFFu) &&
+                        (rdc2 & (1u << 11)) && (edc2 & (1u << 11));   // DEVCAP2.LTR
+    // The endpoint must carry a non-zero LTR max before it may send LTR: a 0
+    // max means it reports zero latency tolerance, which keeps the link out of
+    // L1.2 and the package out of deep states.  Program the Linux quirk value
+    // (VMD_BIOS_PM_QUIRK_LTR, 3145728 ns, snoop and no-snoop) when it is 0.
+    bool ltrMaxOK = false;
+    if (ltrCap) {
+        const uint32_t lp = vmdExtFind(v, ep, PCI_EXT_CAP_ID_LTR);
+        if (lp) {
+            const uint32_t lmask = PCI_LTR_VALUE_MASK | PCI_LTR_SCALE_MASK;
+            uint32_t lm = vmdExtRead32(v, ep, lp + PCI_LTR_MAX_SNOOP_LAT);
+            if (lm != 0xFFFFFFFFu && !(lm & lmask)) {
+                vmdExtWrite32(v, ep, lp + PCI_LTR_MAX_SNOOP_LAT,
+                              ((uint32_t)VMD_BIOS_PM_QUIRK_LTR << 16) | VMD_BIOS_PM_QUIRK_LTR);
+                lm = vmdExtRead32(v, ep, lp + PCI_LTR_MAX_SNOOP_LAT);
+                ep->setProperty("VMD-LinkPM-EP-LTRMAX-Set", (unsigned long long)lm, 32);
+            }
+            ltrMaxOK = (lm != 0xFFFFFFFFu) && (lm & lmask) && ((lm >> 16) & lmask);
+        }
+        if (!ltrMaxOK)
+            ep->setProperty("VMD-LinkPM-L1SS-Note", "no usable endpoint LTR max: LTR_EN and L1.2 left off");
+    }
+    bool ltr = false;
+    if (ltrCap && ltrMaxOK && vmdRmw16(rp, rc + 0x28, 0, 0x0400) && vmdRmw16(ep, ec + 0x28, 0, 0x0400)) {
+        const UInt16 r2 = rp->configRead16(rc + 0x28), e2 = ep->configRead16(ec + 0x28);
+        ltr = (r2 != 0xFFFF) && (e2 != 0xFFFF) && (r2 & 0x0400) && (e2 & 0x0400);
+    }
+    ep->setProperty("VMD-LinkPM-LTR-EN", ltr);
+    if (!ltr) ecap &= ~0x4u;                         // ASPM L1.2 needs LTR (aspm_l1ss_init)
+
+    const uint32_t en = rcap & ecap & 0xC;           // bit3 ASPM L1.1, bit2 ASPM L1.2
+    if (!en) {
+        ep->setProperty("VMD-LinkPM-L1SS-Skipped", "no common ASPM L1.x");
+        return 0;
+    }
+    // Every read-modify-write below starts from a sane control register.
+    if (vmdExtRead32(v, ep, es + VMD_L1SS_CTL1) == 0xFFFFFFFFu ||
+        vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1) == 0xFFFFFFFFu ||
+        vmdExtRead32(v, ep, es + VMD_L1SS_CTL2) == 0xFFFFFFFFu ||
+        vmdExtRead32(v, rp, rs + VMD_L1SS_CTL2) == 0xFFFFFFFFu) {
+        ep->setProperty("VMD-LinkPM-L1SS-Skipped", "L1SS control read all-ones");
+        return 0;
+    }
+
+    // All L1.x off: child first, then parent (pcie_config_aspm_l1ss).
+    vmdExtWrite32(v, ep, es + VMD_L1SS_CTL1, vmdExtRead32(v, ep, es + VMD_L1SS_CTL1) & ~0xFu);
+    vmdExtWrite32(v, rp, rs + VMD_L1SS_CTL1, vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1) & ~0xFu);
+
+    if (en & 0x4) {                                  // aspm_calc_l12_info()
+        const uint32_t rcm = (rcap >> 8) & 0xFF, ecm = (ecap >> 8) & 0xFF;
+        const uint32_t cm = (rcm > ecm) ? rcm : ecm;
+        const uint32_t rpo = vmdL12PwrOnUs(rcap), epo = vmdL12PwrOnUs(ecap);
+        const uint32_t pcap = (rpo > epo) ? rcap : ecap;
+        const uint32_t tpo = (rpo > epo) ? rpo : epo;
+        const uint32_t ctl2 = (((pcap >> 19) & 0x1F) << 3) | ((pcap >> 16) & 3);
+        uint32_t sc = 0, val = 0;
+        vmdEncodeL12Th(2 + 4 + cm + tpo, &sc, &val);
+        const uint32_t th = (sc << 29) | (val << 16);
+        // T_POWER_ON in both ports
+        vmdExtWrite32(v, rp, rs + VMD_L1SS_CTL2, (vmdExtRead32(v, rp, rs + VMD_L1SS_CTL2) & ~0xFBu) | ctl2);
+        vmdExtWrite32(v, ep, es + VMD_L1SS_CTL2, (vmdExtRead32(v, ep, es + VMD_L1SS_CTL2) & ~0xFBu) | ctl2);
+        // Common_Mode_Restore_Time in the Downstream Port (root port) only
+        vmdExtWrite32(v, rp, rs + VMD_L1SS_CTL1, (vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1) & ~0x0000FF00u) | (cm << 8));
+        // LTR_L1.2_THRESHOLD in both ports
+        vmdExtWrite32(v, rp, rs + VMD_L1SS_CTL1, (vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1) & ~0xE3FF0000u) | th);
+        vmdExtWrite32(v, ep, es + VMD_L1SS_CTL1, (vmdExtRead32(v, ep, es + VMD_L1SS_CTL1) & ~0xE3FF0000u) | th);
+        ep->setProperty("VMD-LinkPM-L12-ThresholdUs", (unsigned long long)(2 + 4 + cm + tpo), 32);
+    }
+
+    // Enable: parent first, then child.
+    vmdExtWrite32(v, rp, rs + VMD_L1SS_CTL1, vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1) | en);
+    vmdExtWrite32(v, ep, es + VMD_L1SS_CTL1, vmdExtRead32(v, ep, es + VMD_L1SS_CTL1) | en);
+    ep->setProperty("VMD-LinkPM-L1SS-Enabled", (unsigned long long)en, 32);
+    ep->setProperty("VMD-LinkPM-RP-L1SSCTL1", (unsigned long long)vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1), 32);
+    ep->setProperty("VMD-LinkPM-RP-L1SSCTL2", (unsigned long long)vmdExtRead32(v, rp, rs + VMD_L1SS_CTL2), 32);
+    ep->setProperty("VMD-LinkPM-EP-L1SSCTL1", (unsigned long long)vmdExtRead32(v, ep, es + VMD_L1SS_CTL1), 32);
+    ep->setProperty("VMD-LinkPM-EP-L1SSCTL2", (unsigned long long)vmdExtRead32(v, ep, es + VMD_L1SS_CTL2), 32);
+    return 4;
+}
+
+/* bit0 without bit2 = plain ASPM L1.  Called with ASPM L1 OFF on both
+ * partners: clear any L1.x enable firmware left set (child first, then
+ * parent, as pcie_config_aspm_l1ss), so L1.1/L1.2 never run with unvalidated
+ * timing or without LTR_EN.  Same meaning IOPCIFamily gives
+ * pci-aspm-default = 2 (setDeviceL1PMBits zeroes L1PM Control 1/2). */
+static void vmdClearL1SS(VMDDriver *v, IOPCIDevice *rp, IOPCIDevice *ep)
+{
+    const uint32_t rs = vmdExtFind(v, rp, VMD_EXT_CAP_L1SS);
+    const uint32_t es = vmdExtFind(v, ep, VMD_EXT_CAP_L1SS);
+    if (!rs || !es) return;                           // L1.x needs both ends
+    const uint32_t e1 = vmdExtRead32(v, ep, es + VMD_L1SS_CTL1);
+    const uint32_t r1 = vmdExtRead32(v, rp, rs + VMD_L1SS_CTL1);
+    if (e1 == 0xFFFFFFFFu || r1 == 0xFFFFFFFFu) return;
+    if (!((e1 | r1) & 0xFu)) return;                  // nothing enabled: no write
+    vmdExtWrite32(v, ep, es + VMD_L1SS_CTL1, e1 & ~0xFu);
+    vmdExtWrite32(v, rp, rs + VMD_L1SS_CTL1, r1 & ~0xFu);
+    ep->setProperty("VMD-LinkPM-L1SS-Cleared",
+                    (unsigned long long)(((r1 & 0xFu) << 4) | (e1 & 0xFu)), 32);
+}
+
+static void vmdLinkPMOptIn(VMDDriver *v, IOPCIDevice *rp, IOPCIDevice *ep)
+{
+    uint32_t raw = 0;
+    const bool found = PE_parse_boot_argn("vmdaspm", &raw, sizeof(raw));
+    // A non-numeric value ("off", "on") comes back as up to 3 raw chars with
+    // found == true; only 0..7 is accepted.
+    const uint32_t mask = (found && raw <= 7) ? raw : 0;
+    ep->setProperty("VMD-LinkPM-Requested", (unsigned long long)mask, 32);
+    if (!mask) {
+        if (found && raw > 7)
+            ep->setProperty("VMD-LinkPM-BadArg", (unsigned long long)raw, 32);
+        return;
+    }
+
+    UInt8 rc = 0, ec = 0;
+    if (!v || !rp || !rp->findPCICapability(kIOPCIPCIExpressCapability, &rc) || !rc ||
+        !ep->findPCICapability(kIOPCIPCIExpressCapability, &ec) || !ec) {
+        ep->setProperty("VMD-LinkPM-Skipped", "no PCIe capability");
+        return;
+    }
+    // NVMe function (class 0x010802) directly below a Root Port only.
+    if ((ep->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x010802 ||
+        ((rp->configRead16(rc + 0x02) >> 4) & 0xF) != 0x4) {
+        ep->setProperty("VMD-LinkPM-Skipped", "not NVMe below a Root Port");
+        return;
+    }
+    gVmdLinkPMMask = mask;
+    vmdLinkPMSnapshot(v, rp, ep, "Pre");
+
+    const uint32_t rcap = rp->configRead32(rc + 0x0C);   // LNKCAP
+    const uint32_t ecap = ep->configRead32(ec + 0x0C);
+    const uint32_t edevcap = ep->configRead32(ec + 0x04); // DEVCAP
+    const UInt16 rctl = rp->configRead16(rc + 0x10);      // LNKCTL
+    const UInt16 ectl = ep->configRead16(ec + 0x10);
+    ep->setProperty("VMD-LinkPM-RP-LNKCAP", (unsigned long long)rcap, 32);
+    ep->setProperty("VMD-LinkPM-EP-LNKCAP", (unsigned long long)ecap, 32);
+    ep->setProperty("VMD-LinkPM-EP-DEVCAP", (unsigned long long)edevcap, 32);
+    ep->setProperty("VMD-LinkPM-RP-LNKCTL-Old", (unsigned long long)rctl, 16);
+    ep->setProperty("VMD-LinkPM-EP-LNKCTL-Old", (unsigned long long)ectl, 16);
+    if (rcap == 0xFFFFFFFFu || ecap == 0xFFFFFFFFu || edevcap == 0xFFFFFFFFu ||
+        rctl == 0xFFFF || ectl == 0xFFFF) {
+        ep->setProperty("VMD-LinkPM-Skipped", "config read all-ones");
+        return;
+    }
+
+    // Linux pcie_aspm_check_latency(): the larger L1 exit latency (LNKCAP
+    // [17:15], 2^n us) must not exceed the endpoint's DEVCAP L1 acceptable
+    // latency ([11:9], 2^n us, 7 = no limit).  Direct RP link: no switch term.
+    const uint32_t accL1 = (edevcap >> 9) & 7;
+    const uint32_t rEx = (rcap >> 15) & 7, eEx = (ecap >> 15) & 7;
+    const uint32_t exL1 = (rEx > eEx) ? rEx : eEx;
+    const bool l1LatOK = (accL1 == 7) || (exL1 <= accL1);
+    const bool l1Cap = (rcap & (1u << 11)) && (ecap & (1u << 11));   // ASPM Support L1
+
+    uint32_t applied = 0;
+    if (mask & 1) {
+        if (!l1Cap) {
+            ep->setProperty("VMD-LinkPM-Skipped", "L1 not supported by both ports");
+        } else if (!l1LatOK) {
+            ep->setProperty("VMD-LinkPM-Skipped", "L1 exit latency > EP acceptable");
+        } else if (!vmdRmw16(ep, ec + 0x10, 0x0003, 0) ||     // ASPM L1 off: endpoint first,
+                   !vmdRmw16(rp, rc + 0x10, 0x0003, 0)) {     // then root port
+            ep->setProperty("VMD-LinkPM-Skipped", "LNKCTL read all-ones");
+        } else {
+            if (mask & 4)
+                applied |= vmdEnableL1SS(v, rp, ep, rc, ec);
+            else
+                vmdClearL1SS(v, rp, ep);                      // bit0 = plain L1
+            // ASPM L1 on: root port first, then endpoint.
+            if (vmdRmw16(rp, rc + 0x10, 0x0003, 0x0002) &&
+                vmdRmw16(ep, ec + 0x10, 0x0003, 0x0002)) {
+                applied |= 1;
+                // keep IOPCIFamily's ASPM view in step with the hardware (L1)
+                uint32_t l1 = 2;
+                OSData *d = OSData::withBytes(&l1, sizeof(l1));
+                if (d) {
+                    ep->setProperty(kIOPCIExpressASPMDefaultKey, d);
+                    d->release();
+                }
+                ep->setProperty("VMD-Dbg-ASPM-Prop", (unsigned long long)2, 32);
+            }
+        }
+    }
+    // LNKCAP bit 18 = Clock Power Management; LNKCTL bit 8 = ECPM.
+    if ((mask & 2) && (ecap & (1u << 18)) && vmdRmw16(ep, ec + 0x10, 0, 0x0100))
+        applied |= 2;
+    ep->setProperty("VMD-LinkPM-Applied", (unsigned long long)applied, 32);
+    vmdLinkPMSnapshot(v, rp, ep, "Set");
+}
+
 void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!rp || !nub2) return;
@@ -1842,6 +2231,8 @@ void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2)
     vmdBridgeCheck(rp, nub2);
 
     appleNVMeInitDebug(nub2);
+
+    vmdLinkPMOptIn(this, rp, nub2);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -3098,6 +3489,8 @@ bool VMDChildDevice::handleOpen(IOService * forClient, IOOptionBits options, voi
         nub2 = this;
         rp=OSDynamicCast(IOPCIDevice,nub2->getParentEntry( gIODTPlane));
         pvmd->vmdBridgeCheck(rp, nub2);
+        // opt-in only: link PM state as IONVMe starts
+        if (gVmdLinkPMMask) vmdLinkPMSnapshot(pvmd, rp, nub2, "Open");
         
     }
     return IOPCIDevice::handleOpen(forClient,  options,  arg);
@@ -3115,6 +3508,9 @@ void VMDChildDevice::handleClose(IOService * forClient, IOOptionBits options)
             this->setProperty("VMD-Close-INTMS", (unsigned long long)rmmioPtr[0x0C / 4], 64);
         }
         this->setProperty("VMD-INT-Dispatched", (unsigned long long)fIntDispatched, 64);
+        // opt-in only: link PM state + AER counts at close
+        if (gVmdLinkPMMask && pvmd && !strcmp(forClient->getName(), "IONVMeController"))
+            vmdLinkPMSnapshot(pvmd, OSDynamicCast(IOPCIDevice, getParentEntry(gIODTPlane)), this, "Close");
     }
     IOPCIDevice::handleClose(forClient, options);
 }
