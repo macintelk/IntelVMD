@@ -265,6 +265,30 @@ private:
     IOWorkLoop *            fVmdWorkLoop;
     IOInterruptEventSource *fBridgeES;      /* reserves MSI-X vector 0     */
 
+    /* MSI remap demux (Linux vmd_irq() model).  Client VMDs such as
+     * 9A0B have no VMD_FEAT_CAN_BYPASS_MSI_REMAP: the VMD always remaps a
+     * child MSI onto one of its OWN MSI-X vectors (address bits 19:12 = VMD
+     * vector index).  Every VMD vector therefore gets a primary-context
+     * handler that forwards to the child handlers registered through
+     * VMDChildDevice::registerInterrupt(). */
+    enum { kVMDMaxDemuxKids = 8, kVMDMaxIrqStat = 32 };
+    VMDChildDevice *        fDemuxKids[kVMDMaxDemuxKids];
+    volatile UInt32         fDemuxKidCount;
+    volatile UInt32         fIrqHits[kVMDMaxIrqStat];
+    volatile UInt32         fIrqOrphan[kVMDMaxIrqStat];  /* no kid aimed at it */
+    UInt32                  fIrqVectorsRegistered;
+    UInt32                  fRegMask;       /* VMD indices registered+enabled */
+    IOTimerEventSource *    fIrqStatTimer;
+    UInt32                  fIrqStatTicks;
+
+    bool registerDemuxVectors(void);
+    void vmdDemuxInterrupt(void *refCon, IOService *nub, int source);
+    void irqStatTick(IOTimerEventSource *sender);
+    void snapshotVmdMsix(void);
+    uint32_t allocDemuxVector(void);
+    bool releaseDeferredKid(VMDChildDevice *kid);
+    uint32_t waitDomainAccessible(uint32_t maxMS);
+
     VMDBarInfo bars[3];
     IOMemoryMap *           fMap1;
     IOMemoryMap *           fMap2;
@@ -304,6 +328,12 @@ public:
     void vmdBridgeCheck(IOPCIDevice *rp, IOPCIDevice *nub2);
 
     void composeChildMSI(IOPCIDevice *nub);
+
+    /* Demux bookkeeping (thread context only) */
+    bool addDemuxChild(VMDChildDevice *kid);
+    bool isDemuxMode(void) const { return fDemuxMode; }
+    /* true if the entry lies inside this VMD's domain (below fBridgeEntry) */
+    bool ownsConfigEntry(IOPCIConfigEntry *entry) const;
 
 
     IOPCIDevice * vmdDevice(void) const { return fPCIDev; }
@@ -346,7 +376,9 @@ public:
 
     inline volatile uint8_t * cfgBar(void) const { return fCfgBar; }
     inline uint8_t busnStart(void) const { return fBusnStart; }
-    void configure1( IOService * provider );
+    /* Returns false (and writes nothing) if the live BARs are
+     * unusable; the probe then aborts and VMD0 is left untouched. */
+    bool configure1( IOService * provider );
     void configurePCISpace(const char *propName, IOService *pciDevice,
                            IOPCIAddressSpace addrSpace,
                            UInt64 address,
@@ -362,8 +394,56 @@ class VMDChildDevice : public IOPCIDevice
     
 public:
     
+    IOMemoryMap *rmmio {nullptr};
+    volatile UInt32 *rmmioPtr {nullptr};
     uint32_t fVmdVector {0xFFFFFFFF};
-    
+
+    /* Demux-mode interrupt plumbing.  When fDemux is set (endpoint
+     * wired onto a VMD vector by VMDDriver::wireChildMSI), the IOService
+     * interrupt KPI below is served here instead of by the stock
+     * IOPCIMessagedInterruptController: the handler is stored and called
+     * from VMDDriver::vmdDemuxInterrupt() when the VMD vector fires. */
+    bool                fDemux {false};
+    volatile bool       fIntEnabled {false};
+    volatile bool       fIntPending {false};   /* fired while disabled */
+    IOSimpleLock *      fIntLock {nullptr};
+    OSObject *          fIntTarget {nullptr};
+    IOInterruptAction   fIntHandler {nullptr};
+    void *              fIntRefCon {nullptr};
+    int                 fIntSource {0};
+    volatile UInt32     fIntDispatched {0};
+    volatile UInt32     fIntLatched {0};       /* fired while disabled */
+    UInt32              fIntEnableCalls {0};
+    /* stuck-INTMS rescue (irqStatTick, thread context) */
+    UInt32              fLastDispatchSeen {0};
+    UInt32              fStallTicks {0};
+    UInt32              fIntmsRescues {0};
+    /* Created with "pci-deferred-registration" so Apple's
+     * IOPCI2PCIBridge attaches (publishes) the nub but does not register it
+     * for matching; VMDDriver::start() registers it after postScanConfigure */
+    bool                fRegDeferred {false};
+    /* attach did not happen within the configure wait: the fix-ups are run
+     * later from VMDDriver::irqStatTick() and only then is it registered */
+    bool                fCfgPending {false};
+    IOPCIConfigEntry *  fCfgEntry {nullptr};
+    IOPCIDevice *       fCfgParent {nullptr};
+    int                 fCfgDepth {0};
+
+    void demuxDispatch(void);   /* primary interrupt context */
+    /* initializeNub() ran (parent bridge set): IOPCIDevice config access
+     * works only from then on.  NOT the same as service-plane attachment,
+     * which is getProvider() != NULL. */
+    bool vmdConfigAccessible(void) const { return parent != NULL; }
+
+    virtual IOReturn registerInterrupt(int source, OSObject *target,
+                                       IOInterruptAction handler,
+                                       void *refCon = 0) override;
+    virtual IOReturn unregisterInterrupt(int source) override;
+    virtual IOReturn getInterruptType(int source, int *interruptType) override;
+    virtual IOReturn enableInterrupt(int source) override;
+    virtual IOReturn disableInterrupt(int source) override;
+    virtual void handleClose(IOService * forClient, IOOptionBits options) override;
+
     /*
     virtual IOReturn configureInterrupts(UInt32 interruptType,
                                          UInt32 numRequired,
