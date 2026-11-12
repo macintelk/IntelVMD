@@ -2307,18 +2307,22 @@ void VMDDriver::enableLTRQuirk(IOPCIDevice *dev)
     if (!extendedFindPCICapability(space, -PCI_EXT_CAP_ID_LTR, &pos) || !pos)
         return;
 
+    // Max Snoop/No-Snoop Latency register (cap + 0x4), not the capability
+    // header, like pos + PCI_LTR_MAX_SNOOP_LAT in Linux vmd_pm_enable_quirk()
+    uint32_t reg = (uint32_t)pos + PCI_LTR_MAX_SNOOP_LAT;
+
     // full 12-bit offset through the extended space bits
     IOPCIAddressSpace es = space;
     es.bits &= ~0x0F000000;
-    es.es.registerNumExtended = ((uint32_t)pos >> 8) & 0xF;
+    es.es.registerNumExtended = (reg >> 8) & 0xF;
 
     // skip if BIOS already programmed the max snoop LTR
-    uint32_t ltrReg = configRead32(es, (UInt8)(pos & 0xFF));
+    uint32_t ltrReg = configRead32(es, (UInt8)(reg & 0xFF));
     if (ltrReg & (PCI_LTR_VALUE_MASK | PCI_LTR_SCALE_MASK)) return;
 
     uint16_t ltr = VMD_BIOS_PM_QUIRK_LTR;
     ltrReg = ((uint32_t)ltr << 16) | ltr;
-    configWrite32(es, (UInt8)(pos & 0xFF), ltrReg);
+    configWrite32(es, (UInt8)(reg & 0xFF), ltrReg);
     IOLog("IntelVMD: Default LTR value set by driver (%02x:%02x.%x)\n",
           dev->space.s.busNum, dev->space.s.deviceNum,
           dev->space.s.functionNum);
