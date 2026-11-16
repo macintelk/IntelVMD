@@ -24,6 +24,8 @@ struct VMDDeviceEntry {
     unsigned long features;
 };
 
+uint32_t defaspm = 0; // for 2 check NVMeFixPlugin::PM
+
 static const VMDDeviceEntry kVMDDevices[] = {
     /* PCI_VDEVICE(INTEL, VMD_201D), SHADOW_VSCAP */
     { 0x201d, "VMD 201d (Skylake-X/Xeon)",  VMD_FEAT_HAS_MEMBAR_SHADOW_VSCAP },
@@ -1045,8 +1047,12 @@ bool VMDDriver::seedBridgeEntry(void)
     bridge->expressCapBlock = 0;
 
     if (bridge->dtEntry) {
-        bridge->dtEntry->setProperty(kIOPCIIgnoreLinkStatusKey, true);
-        bridge->dtEntry->setProperty(kIOPCIExpressASPMDefaultKey, 2, 32);
+        //bridge->dtEntry->setProperty(kIOPCIIgnoreLinkStatusKey, true);
+        OSData *aspmProp = OSData::withBytes(&defaspm, sizeof(defaspm));
+        if (aspmProp) {
+            bridge->dtEntry->setProperty(kIOPCIExpressASPMDefaultKey, aspmProp);
+            aspmProp->release();
+        }
     }
 
     // Bus-number range (Linux: vmd->resources[0] IORESOURCE_BUS).
@@ -1667,9 +1673,9 @@ void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!rp || !nub2) return;
 
-    uint32_t aspmOff = 0;
-    OSData *aspmProp = OSData::withBytes(&aspmOff, sizeof(aspmOff));
+    OSData *aspmProp = OSData::withBytes(&defaspm, sizeof(defaspm));
     if (aspmProp) {
+        rp->setProperty(kIOPCIExpressASPMDefaultKey, aspmProp);
         nub2->setProperty(kIOPCIExpressASPMDefaultKey, aspmProp);
         aspmProp->release();
     }
