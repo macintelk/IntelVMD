@@ -1,2 +1,0 @@
-# IntelVMD
-IntelVMD
