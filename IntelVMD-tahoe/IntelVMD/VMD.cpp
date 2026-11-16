@@ -1046,7 +1046,7 @@ bool VMDDriver::seedBridgeEntry(void)
 
     if (bridge->dtEntry) {
         bridge->dtEntry->setProperty(kIOPCIIgnoreLinkStatusKey, true);
-        //bridge->dtEntry->setProperty(kIOPCIExpressASPMDefaultKey, 2, 32);
+        bridge->dtEntry->setProperty(kIOPCIExpressASPMDefaultKey, 2, 32);
     }
 
     // Bus-number range (Linux: vmd->resources[0] IORESOURCE_BUS).
@@ -1667,7 +1667,7 @@ void VMDDriver::endpointLinkPrep(IOPCIDevice *rp, IOPCIDevice *nub2)
 {
     if (!rp || !nub2) return;
 
-    uint32_t aspmOff = 2;
+    uint32_t aspmOff = 0;
     OSData *aspmProp = OSData::withBytes(&aspmOff, sizeof(aspmOff));
     if (aspmProp) {
         nub2->setProperty(kIOPCIExpressASPMDefaultKey, aspmProp);
