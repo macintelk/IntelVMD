@@ -7,3 +7,5 @@ if u believe this bs then go away
 
 working version is tahoe branch
 install in opencore kext folder
+
+Other versions of this project are described in issues
