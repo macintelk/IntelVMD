@@ -676,14 +676,15 @@ void VMDDriver::configure1( IOService * provider )
         }
     }
     
+    UInt64 addressnew=    (UInt64)pciDevice->configRead32(kIOPCIConfigBaseAddress1) << 32;
+    if (!addressnew) return;
+    
     pciDevice->setMemoryEnable(false);
     pciDevice->configWrite32(kIOPCIConfigBaseAddress0,  0);
     pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03100000);
     //pciDevice->configWrite32(kIOPCIConfigBaseAddress4,  0x03102000);
 
     pciDevice->setMemoryEnable(true);
-    UInt64 addressnew=    (UInt64)pciDevice->configRead32(kIOPCIConfigBaseAddress1) << 32;
-    
     
     IOPCIAddressSpace space;
     space.s.busNum = busStart;
@@ -2199,7 +2200,6 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
     bool wrote = false;
     uint8_t cap = 0;
     
-    // MSI 1st place
     if (!wrote
         && nub->findPCICapability(kIOPCICapabilityIDMSI, &cap) && cap) {
         uint16_t ctrl = nub->configRead16(cap + PCI_MSI_FLAGS);
@@ -2224,70 +2224,6 @@ void VMDDriver::composeChildMSI(IOPCIDevice *nub)
             wrote = true;
         }
     }
-    
-
-    // MSI-X 2nd place
-    if (!wrote)
-    if (nub->findPCICapability(kIOPCICapabilityIDMSIX, &cap) && cap) {
-        uint16_t ctrl = nub->configRead16(cap + PCI_MSIX_FLAGS);
-        nub->setProperty("VMD-MSI-Mode", "MSI-X");
-        nub->setProperty("VMD-MSI-Ctrl", ctrl, 16);
-        if (((ctrl & PCI_MSIX_FLAGS_ENABLE) == 0)) {
-            uint8_t msiCap = 0;
-            if (nub->findPCICapability(kIOPCICapabilityIDMSI, &msiCap)
-                && msiCap) {
-                uint16_t msiCtrl = nub->configRead16(msiCap + PCI_MSI_FLAGS);
-                if (msiCtrl & PCI_MSI_FLAGS_ENABLE) {
-                    nub->configWrite16(msiCap + PCI_MSI_FLAGS,
-                                       msiCtrl & ~PCI_MSI_FLAGS_ENABLE);
-                    nub->setProperty("VMD-MSI-MSI-Cleared", true);
-                }
-            }
-            ctrl |= PCI_MSIX_FLAGS_ENABLE;
-            nub->configWrite16(cap + PCI_MSIX_FLAGS, ctrl);
-            ctrl = nub->configRead16(cap + PCI_MSIX_FLAGS);
-            if (ctrl & PCI_MSIX_FLAGS_ENABLE)
-                nub->setProperty("VMD-MSI-MSIX-En-Fixed", true);
-        }
-        if (ctrl & PCI_MSIX_FLAGS_ENABLE) {
-            uint32_t tobir = nub->configRead32(cap + PCI_MSIX_TABLE_OFFSET);
-            uint8_t  bir   = tobir & 7;
-            uint64_t toff  = tobir & ~7ULL;
-            IOMemoryMap *bar = nub->mapDeviceMemoryWithRegister(
-                        kIOPCIConfigBaseAddress0 + 4 * bir,
-                        kIOMapInhibitCache | kIOMapAnywhere);
-            if (bar) {
-                volatile UInt8 *table =
-                    (volatile UInt8 *)bar->getVirtualAddress() + toff;
-                uint16_t nvec = (ctrl & 0x7FF) + 1;
-                for (uint16_t i = 0; i < nvec; i++) {
-                    volatile UInt32 *entry = (volatile UInt32 *)
-                        (table + (uint32_t)i * PCI_MSIX_ENTRY_SIZE);
-                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_UPPER_ADDR, addrHi);
-                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_LOWER_ADDR, addrLo);
-                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_DATA, vec);
-                    // Vector Control bit 0 = Mask.  Entries come up masked
-                    // after reset and a masked entry swallows the interrupt
-                    // even with MSI-X enabled; IOPCIFamily only unmasks
-                    // vectors it allocated through the stock path.
-                    OSWriteLittleInt32(entry, PCI_MSIX_ENTRY_VECTOR_CTRL, 0);
-                }
-                nub->setProperty("VMD-MSI-AddrLo",
-                                 (unsigned long long)addrLo, 32);
-                nub->setProperty("VMD-MSI-Verify",
-                    OSReadLittleInt32((volatile UInt32 *)table,
-                                      PCI_MSIX_ENTRY_LOWER_ADDR), 32);
-                nub->setProperty("VMD-MSI-Verify-Ctrl",
-                    OSReadLittleInt32((volatile UInt32 *)table,
-                                      PCI_MSIX_ENTRY_VECTOR_CTRL), 32);
-                bar->release();
-                wrote = true;
-            } else {
-                nub->setProperty("VMD-MSI-Table-Map-Failed", true);
-            }
-        }
-    }
-
     
 
     if (!wrote) {
